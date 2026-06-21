@@ -15,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/transport/v2ray"
 	"github.com/sagernet/sing-vmess/packetaddr"
 	"github.com/sagernet/sing-vmess/vless"
+	"github.com/sagernet/sing-vmess/vless/encryption"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -32,6 +33,7 @@ type Outbound struct {
 	logger          logger.ContextLogger
 	dialer          N.Dialer
 	client          *vless.Client
+	encryption      *encryption.ClientInstance
 	serverAddr      M.Socksaddr
 	multiplexDialer *mux.Client
 	tlsConfig       tls.Config
@@ -87,6 +89,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		}
 	}
 	outbound.client, err = vless.NewClient(options.UUID, options.Flow, logger)
+	if err != nil {
+		return nil, err
+	}
+	outbound.encryption, err = encryption.NewClient(options.Encryption)
 	if err != nil {
 		return nil, err
 	}
@@ -158,6 +164,12 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 	if err != nil {
 		return nil, err
 	}
+	encryptedConn, err := h.applyEncryption(conn)
+	if err != nil {
+		common.Close(conn)
+		return nil, err
+	}
+	conn = encryptedConn
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
@@ -201,6 +213,12 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 		common.Close(conn)
 		return nil, err
 	}
+	encryptedConn, err := h.applyEncryption(conn)
+	if err != nil {
+		common.Close(conn)
+		return nil, err
+	}
+	conn = encryptedConn
 	if h.xudp {
 		return h.client.DialEarlyXUDPPacketConn(conn, destination)
 	} else if h.packetAddr {
@@ -215,4 +233,11 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	} else {
 		return h.client.DialEarlyPacketConn(conn, destination)
 	}
+}
+
+func (h *vlessDialer) applyEncryption(conn net.Conn) (net.Conn, error) {
+	if h.encryption == nil {
+		return conn, nil
+	}
+	return h.encryption.Handshake(conn)
 }
