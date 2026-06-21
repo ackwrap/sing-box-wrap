@@ -1,0 +1,71 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: Sync upstream to sync and devel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout sync branch
+        uses: actions/checkout@v4
+        with:
+          ref: sync
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/SagerNet/sing-box.git || true
+          git remote set-url upstream https://github.com/SagerNet/sing-box.git
+
+      - name: Fetch branches
+        run: |
+          git fetch origin sync devel
+          git fetch upstream testing
+
+      - name: Mirror upstream testing branch to sync
+        run: |
+          git checkout -B sync upstream/testing
+
+      - name: Push sync branch
+        run: |
+          git push --force-with-lease origin sync
+
+      - name: Try merging sync into devel
+        id: merge-devel
+        run: |
+          git checkout -B devel origin/devel
+          if git merge --no-edit sync; then
+            git push origin devel
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create pull request when devel merge conflicts
+        if: steps.merge-devel.outputs.merged == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          existing_pr_count="$(gh pr list --base devel --head sync --state open --json number --jq 'length')"
+          if [ "$existing_pr_count" -eq 0 ]; then
+            gh pr create \
+              --base devel \
+              --head sync \
+              --title "Sync upstream into devel" \
+              --body "Automated upstream sync could not be merged into devel cleanly. Please resolve conflicts and merge this PR."
+          else
+            echo "An open sync -> devel pull request already exists."
+          fi
