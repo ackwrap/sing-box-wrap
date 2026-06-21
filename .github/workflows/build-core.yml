@@ -263,7 +263,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Set name
         run: |-
-          DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          DIR_NAME="sing-wrap-${{ needs.calculate_version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
           if [[ -n "${{ matrix.goarm }}" ]]; then
             DIR_NAME="${DIR_NAME}v${{ matrix.goarm }}"
           elif [[ -n "${{ matrix.go386 }}" && "${{ matrix.go386 }}" != 'sse2' ]]; then
@@ -294,7 +294,7 @@ jobs:
             --architecture all \
             dist/sing-box=/usr/bin/sing-box
           for architecture in ${{ matrix.openwrt }}; do
-            .github/deb2ipk.sh "$architecture" "dist/openwrt.deb" "dist/sing-box_${{ needs.calculate_version.outputs.version }}_openwrt_${architecture}.ipk"
+            .github/deb2ipk.sh "$architecture" "dist/openwrt.deb" "dist/sing-wrap_${{ needs.calculate_version.outputs.version }}_openwrt_${architecture}.ipk"
           done
           rm "dist/openwrt.deb"
       - name: Install apk-tools
@@ -310,7 +310,7 @@ jobs:
               "$architecture" \
               "${{ needs.calculate_version.outputs.version }}" \
               "dist/sing-box" \
-              "dist/sing-box_${{ needs.calculate_version.outputs.version }}_openwrt_${architecture}.apk"
+              "dist/sing-wrap_${{ needs.calculate_version.outputs.version }}_openwrt_${architecture}.apk"
           done
       - name: Archive
         run: |
@@ -407,7 +407,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Set name
         run: |-
-          DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-darwin-${{ matrix.arch }}"
+          DIR_NAME="sing-wrap-${{ needs.calculate_version.outputs.version }}-darwin-${{ matrix.arch }}"
           if [[ -n "${{ matrix.legacy_name }}" ]]; then
             DIR_NAME="${DIR_NAME}-legacy-${{ matrix.legacy_name }}"
           fi
@@ -496,7 +496,7 @@ jobs:
       - name: Archive
         if: matrix.naive
         run: |
-          $DIR_NAME = "sing-box-${{ needs.calculate_version.outputs.version }}-windows-${{ matrix.arch }}"
+          $DIR_NAME = "sing-wrap-${{ needs.calculate_version.outputs.version }}-windows-${{ matrix.arch }}"
           mkdir "dist/$DIR_NAME"
           Copy-Item LICENSE "dist/$DIR_NAME"
           Copy-Item "dist/sing-box.exe" "dist/$DIR_NAME"
@@ -506,7 +506,7 @@ jobs:
       - name: Archive
         if: ${{ !matrix.naive }}
         run: |
-          $DIR_NAME = "sing-box-${{ needs.calculate_version.outputs.version }}-windows-${{ matrix.arch }}"
+          $DIR_NAME = "sing-wrap-${{ needs.calculate_version.outputs.version }}-windows-${{ matrix.arch }}"
           mkdir "dist/$DIR_NAME"
           Copy-Item LICENSE "dist/$DIR_NAME"
           Copy-Item "dist/sing-box.exe" "dist/$DIR_NAME"
