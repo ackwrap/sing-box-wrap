@@ -57,15 +57,18 @@ jobs:
       - name: Create pull request when devel merge conflicts
         if: steps.merge-devel.outputs.merged == 'false'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           existing_pr_count="$(gh pr list --base devel --head sync --state open --json number --jq 'length')"
           if [ "$existing_pr_count" -eq 0 ]; then
-            gh pr create \
+            if ! gh pr create \
               --base devel \
               --head sync \
               --title "Sync upstream into devel" \
-              --body "Automated upstream sync could not be merged into devel cleanly. Please resolve conflicts and merge this PR."
+              --body "Automated upstream sync could not be merged into devel cleanly. Please resolve conflicts and merge this PR."; then
+              echo "GitHub token could not create a pull request. Open it manually:"
+              echo "https://github.com/${{ github.repository }}/compare/devel...sync?expand=1"
+            fi
           else
             echo "An open sync -> devel pull request already exists."
           fi
