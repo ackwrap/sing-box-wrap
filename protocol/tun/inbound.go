@@ -98,6 +98,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	})
 
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
+	if options.NetNs != "" && !C.IsLinux {
+		return nil, E.New("`netns` is only supported on Linux")
+	}
 	tunMTU := options.MTU
 	if tunMTU == 0 {
 		if platformInterface != nil && platformInterface.UnderNetworkExtension() {
@@ -190,6 +193,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		logger:         logger,
 		tunOptions: tun.Options{
 			Name:                                  options.InterfaceName,
+			NetNs:                                 options.NetNs,
 			MTU:                                   tunMTU,
 			GSO:                                   enableGSO,
 			Inet4Address:                          inet4Address,
@@ -266,9 +270,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		if !C.IsAndroid {
 			inbound.tunOptions.AutoRedirectMarkMode = true
-			err = networkManager.RegisterAutoRedirectOutputMark(inbound.tunOptions.AutoRedirectOutputMark)
-			if err != nil {
-				return nil, err
+			if options.NetNs == "" {
+				err = networkManager.RegisterAutoRedirectOutputMark(inbound.tunOptions.AutoRedirectOutputMark)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -355,7 +361,13 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 		if t.tunOptions.Name == "" {
 			t.tunOptions.Name = tun.CalculateInterfaceName("")
 		}
-		if t.platformInterface == nil {
+		if t.tunOptions.NetNs != "" {
+			manager := service.FromContext[adapter.NetworkNamespaceManager](t.ctx)
+			if manager != nil {
+				t.tunOptions.NetNs = manager.ResolvePath(t.tunOptions.NetNs)
+			}
+		}
+		if t.platformInterface == nil || C.IsWindows {
 			t.routeAddressSet = common.FlatMap(t.routeRuleSet, adapter.RuleSet.ExtractIPSet)
 			for _, routeRuleSet := range t.routeRuleSet {
 				ipSets := routeRuleSet.ExtractIPSet()
@@ -420,12 +432,16 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 		}
 		t.logger.Trace("creating stack")
 		t.tunIf = tunInterface
-		var (
-			forwarderBindInterface bool
-			includeAllNetworks     bool
-		)
 		if t.platformInterface != nil {
-			forwarderBindInterface = true
+			err = t.platformInterface.ProcessPlatformOptions(t.platformOptions)
+			if err != nil {
+				closeError := t.tunIf.Close()
+				t.tunIf = nil
+				return E.Errors(E.Cause(err, "process platform options"), closeError)
+			}
+		}
+		var includeAllNetworks bool
+		if t.platformInterface != nil && t.platformInterface.UnderNetworkExtension() {
 			includeAllNetworks = t.platformInterface.NetworkExtensionIncludeAllNetworks()
 		}
 		tunStack, err := tun.NewStack(t.stack, tun.StackOptions{
@@ -436,7 +452,7 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			ICMPTimeout:            C.ICMPTimeout,
 			Handler:                t,
 			Logger:                 t.logger,
-			ForwarderBindInterface: forwarderBindInterface,
+			ForwarderBindInterface: C.IsDarwin,
 			InterfaceFinder:        t.networkManager.InterfaceFinder(),
 			IncludeAllNetworks:     includeAllNetworks,
 		})
