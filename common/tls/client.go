@@ -20,6 +20,7 @@ import (
 )
 
 var errMissingServerName = E.New("missing server_name or insecure=true")
+var errMissingClientConfig = E.New("missing TLS client config")
 
 func parseTLSSpoofOptions(serverName string, options option.OutboundTLSOptions) (string, tlsspoof.Method, error) {
 	spoof, method, err := tlsspoof.ParseOptions(options.Spoof, options.SpoofMethod)
@@ -152,6 +153,9 @@ func (d *defaultDialer) DialTLSContext(ctx context.Context, destination M.Socksa
 }
 
 func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr, echRetry bool) (Conn, error) {
+	if d.config == nil {
+		return nil, errMissingClientConfig
+	}
 	conn, err := d.dialer.DialContext(ctx, N.NetworkTCP, destination)
 	if err != nil {
 		return nil, err
