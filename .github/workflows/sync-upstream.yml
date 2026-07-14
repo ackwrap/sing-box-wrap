@@ -13,11 +13,21 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      - name: Verify sync token
+        env:
+          SYNC_TOKEN: ${{ secrets.ACKWRAPBUILD }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "Repository secret ACKWRAPBUILD is required."
+            exit 1
+          fi
+
       - name: Checkout sync branch
         uses: actions/checkout@v4
         with:
           ref: sync
           fetch-depth: 0
+          token: ${{ secrets.ACKWRAPBUILD }}
 
       - name: Configure git
         run: |
@@ -57,7 +67,7 @@ jobs:
       - name: Create pull request when devel merge conflicts
         if: steps.merge-devel.outputs.merged == 'false'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.ACKWRAPBUILD }}
         run: |
           existing_pr_count="$(gh pr list --base devel --head sync --state open --json number --jq 'length')"
           if [ "$existing_pr_count" -eq 0 ]; then
