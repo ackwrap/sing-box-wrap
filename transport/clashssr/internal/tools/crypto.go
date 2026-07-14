@@ -50,9 +50,7 @@ func KDF(password string, keyLength int) []byte {
 	return result[:keyLength]
 }
 
-type XorShift128Plus struct {
-	state [2]uint64
-}
+type XorShift128Plus struct{ state [2]uint64 }
 
 func (r *XorShift128Plus) Next() uint64 {
 	x, y := r.state[0], r.state[1]

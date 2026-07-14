@@ -24,14 +24,8 @@ func TestSSRUDPPacketRoundTrip(t *testing.T) {
 	left, right := connectedPacketPair(t)
 	defer left.Close()
 	defer right.Close()
-	client := &ssrPacketConn{
-		PacketConn: clientProtocol.PacketConn(cipher.PacketConn(left)),
-		serverAddr: right.LocalAddr(),
-	}
-	server := &ssrPacketConn{
-		PacketConn: serverProtocol.PacketConn(cipher.PacketConn(right)),
-		serverAddr: left.LocalAddr(),
-	}
+	client := &ssrPacketConn{PacketConn: clientProtocol.PacketConn(cipher.PacketConn(left)), serverAddr: right.LocalAddr()}
+	server := &ssrPacketConn{PacketConn: serverProtocol.PacketConn(cipher.PacketConn(right)), serverAddr: left.LocalAddr()}
 	payload := []byte("ssr-udp-payload")
 	destination := &net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 53}
 	if _, err := client.WriteTo(payload, destination); err != nil {

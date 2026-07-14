@@ -37,16 +37,13 @@ func New(method, password string) (*Cipher, error) {
 		return result, nil
 	case "aes-128-cfb":
 		keySize, result.ivSize = 16, aes.BlockSize
-		result.encrypt = blockStream(cipher.NewCFBEncrypter)
-		result.decrypt = blockStream(cipher.NewCFBDecrypter)
+		result.encrypt, result.decrypt = blockStream(cipher.NewCFBEncrypter), blockStream(cipher.NewCFBDecrypter)
 	case "aes-192-cfb":
 		keySize, result.ivSize = 24, aes.BlockSize
-		result.encrypt = blockStream(cipher.NewCFBEncrypter)
-		result.decrypt = blockStream(cipher.NewCFBDecrypter)
+		result.encrypt, result.decrypt = blockStream(cipher.NewCFBEncrypter), blockStream(cipher.NewCFBDecrypter)
 	case "aes-256-cfb":
 		keySize, result.ivSize = 32, aes.BlockSize
-		result.encrypt = blockStream(cipher.NewCFBEncrypter)
-		result.decrypt = blockStream(cipher.NewCFBDecrypter)
+		result.encrypt, result.decrypt = blockStream(cipher.NewCFBEncrypter), blockStream(cipher.NewCFBDecrypter)
 	case "aes-128-ctr":
 		keySize, result.ivSize = 16, aes.BlockSize
 		result.encrypt, result.decrypt = blockStream(cipher.NewCTR), blockStream(cipher.NewCTR)
@@ -117,18 +114,9 @@ func kdf(password string, keyLength int) []byte {
 	return result[:keyLength]
 }
 
-func (c *Cipher) Key() []byte {
-	return append([]byte(nil), c.key...)
-}
-
-func (c *Cipher) IVSize() int {
-	return c.ivSize
-}
-
-func (c *Cipher) StreamConn(conn net.Conn) *Conn {
-	return &Conn{Conn: conn, cipher: c}
-}
-
+func (c *Cipher) Key() []byte                    { return append([]byte(nil), c.key...) }
+func (c *Cipher) IVSize() int                    { return c.ivSize }
+func (c *Cipher) StreamConn(conn net.Conn) *Conn { return &Conn{Conn: conn, cipher: c} }
 func (c *Cipher) PacketConn(conn net.PacketConn) net.PacketConn {
 	return &packetConn{PacketConn: conn, cipher: c}
 }
@@ -205,8 +193,7 @@ func (c *Conn) Write(data []byte) (int, error) {
 		}
 		c.writeStream = stream
 	}
-	packet := make([]byte, len(data))
-	copy(packet, data)
+	packet := append([]byte(nil), data...)
 	c.writeStream.XORKeyStream(packet, packet)
 	if !c.writeIVSent {
 		packet = append(append(make([]byte, 0, len(c.writeIV)+len(packet)), c.writeIV...), packet...)
@@ -253,8 +240,7 @@ func (c *packetConn) WriteTo(data []byte, address net.Addr) (int, error) {
 	copy(packet, iv)
 	copy(packet[len(iv):], data)
 	stream.XORKeyStream(packet[len(iv):], packet[len(iv):])
-	_, err = c.PacketConn.WriteTo(packet, address)
-	if err != nil {
+	if _, err = c.PacketConn.WriteTo(packet, address); err != nil {
 		return 0, err
 	}
 	return len(data), nil

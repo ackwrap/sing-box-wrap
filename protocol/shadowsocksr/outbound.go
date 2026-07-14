@@ -3,7 +3,6 @@ package shadowsocksr
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"net"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -41,21 +40,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, E.Cause(err, "initialize ShadowsocksR cipher")
 	}
-	obfuscation, obfsOverhead, err := obfs.PickObfs(options.Obfs, &obfs.Base{
-		Host:   options.Server,
-		Port:   int(options.ServerPort),
-		Key:    cipher.Key(),
-		IVSize: cipher.IVSize(),
-		Param:  options.ObfsParam,
-	})
+	obfuscation, obfsOverhead, err := obfs.PickObfs(options.Obfs, &obfs.Base{Host: options.Server, Port: int(options.ServerPort), Key: cipher.Key(), IVSize: cipher.IVSize(), Param: options.ObfsParam})
 	if err != nil {
 		return nil, E.Cause(err, "initialize ShadowsocksR obfs")
 	}
-	protocolCodec, err := protocol.PickProtocol(options.Protocol, &protocol.Base{
-		Key:      cipher.Key(),
-		Overhead: obfsOverhead,
-		Param:    options.ProtocolParam,
-	})
+	protocolCodec, err := protocol.PickProtocol(options.Protocol, &protocol.Base{Key: cipher.Key(), Overhead: obfsOverhead, Param: options.ProtocolParam})
 	if err != nil {
 		return nil, E.Cause(err, "initialize ShadowsocksR protocol")
 	}
@@ -64,20 +53,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	return &Outbound{
-		Adapter:    outbound.NewAdapterWithDialerOptions(C.TypeShadowsocksR, tag, options.Network.Build(), options.DialerOptions),
-		logger:     logger,
-		dialer:     outboundDialer,
-		serverAddr: options.ServerOptions.Build(),
-		cipher:     cipher,
-		obfs:       obfuscation,
-		protocol:   protocolCodec,
+		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeShadowsocksR, tag, options.Network.Build(), options.DialerOptions), logger: logger, dialer: outboundDialer,
+		serverAddr: options.ServerOptions.Build(), cipher: cipher, obfs: obfuscation, protocol: protocolCodec,
 	}, nil
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	ctx, metadata := adapter.ExtendContext(ctx)
-	metadata.Outbound = h.Tag()
-	metadata.Destination = destination
+	metadata.Outbound, metadata.Destination = h.Tag(), destination
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
@@ -111,8 +94,7 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	ctx, metadata := adapter.ExtendContext(ctx)
-	metadata.Outbound = h.Tag()
-	metadata.Destination = destination
+	metadata.Outbound, metadata.Destination = h.Tag(), destination
 	h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	conn, err := h.dialer.DialContext(ctx, N.NetworkUDP, h.serverAddr)
 	if err != nil {
@@ -129,9 +111,8 @@ type ssrPacketConn struct {
 }
 
 func (c *ssrPacketConn) WriteTo(payload []byte, address net.Addr) (int, error) {
-	destination := M.SocksaddrFromNet(address)
 	var packet bytes.Buffer
-	if err := M.SocksaddrSerializer.WriteAddrPort(&packet, destination); err != nil {
+	if err := M.SocksaddrSerializer.WriteAddrPort(&packet, M.SocksaddrFromNet(address)); err != nil {
 		return 0, err
 	}
 	packet.Write(payload)
@@ -158,8 +139,4 @@ func (c *ssrPacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
 		address = destination.UDPAddr()
 	}
 	return read, address, nil
-}
-
-func (c *ssrPacketConn) String() string {
-	return fmt.Sprintf("ShadowsocksR packet connection to %s", c.serverAddr)
 }

@@ -49,7 +49,6 @@ func (c *tls12TicketConn) Read(b []byte) (int, error) {
 		if c.decoded.Len() > 0 {
 			return c.decoded.Read(b)
 		}
-
 		buf := pool.Get(pool.RelayBufferSize)
 		n, err := c.Conn.Read(buf)
 		if n > 0 {
@@ -59,7 +58,6 @@ func (c *tls12TicketConn) Read(b []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-
 		c.stateMutex.Lock()
 		handshakeComplete := c.handshakeStatus == 8
 		c.stateMutex.Unlock()
@@ -93,7 +91,6 @@ func (c *tls12TicketConn) Read(b []byte) (int, error) {
 				return 0, err
 			}
 		}
-
 		for c.underDecoded.Len() > 5 {
 			if !bytes.Equal(c.underDecoded.Bytes()[:3], []byte{0x17, 3, 3}) {
 				c.underDecoded.Reset()

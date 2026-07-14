@@ -2,31 +2,17 @@
 
 ## Scope
 
-Ackwrap's sing-box fork restores ShadowsocksR as an outbound only. The removed
-ShadowsocksR inbound remains a compatibility stub and still returns the
-upstream removal error.
-
-## Why This Exists
-
-Upstream sing-box removed ShadowsocksR in 1.6.0, but retained the
-`shadowsocksr` type constant and option schema for migration errors. Ackwrap
-maintains its own core and needs to consume existing SSR subscriptions without
-silently discarding those nodes.
+Ackwrap's sing-box fork restores ShadowsocksR as an outbound only. The removed ShadowsocksR inbound remains a compatibility stub.
 
 ## Implementation
 
 - Registry type: `shadowsocksr`
-- Option schema: existing `option.ShadowsocksROutboundOptions`
 - Protocol/obfs baseline: upstream sing-box 1.5.5 `transport/clashssr`, copied into this fork and adapted to fork-internal pool, tools, KDF, and cipher packages
-- Cipher implementation: fork-maintained `transport/clashssr/shadowstream`, using the Go standard library and the already-present `golang.org/x/crypto/chacha20`
-- Core adapter: `protocol/shadowsocksr/outbound.go`
+- Cipher implementation: fork-maintained `transport/clashssr/shadowstream`, using the Go standard library and the existing `golang.org/x/crypto/chacha20`
 - Supported networks: TCP and native SSR UDP packet transport
-- Construction validates the cipher, protocol, and obfs names before the core
-  starts
-- Dialing uses the request context through the current sing-box dialer, so
-  detours, interface binding, domain resolution, and cancellation remain under
-  sing-box control
 - No Mihomo, Clash, or third-party SSR runtime package is imported
+- HTTP and TLS obfs handshake responses support normal TCP segmentation
+- TLS handshake state and auth-chain UDP PRNG state are serialized; malformed UDP padding is rejected before slicing
 
 ## Supported Protocols
 
@@ -48,40 +34,19 @@ silently discarding those nodes.
 
 ## Supported Ciphers
 
-The fork supports AES-128/192/256 CFB, CTR and OFB, RC4-MD5, RC4-MD5-6,
-ChaCha20-IETF, and `none`/`dummy`. Other classic or AEAD methods are rejected
-during outbound construction instead of being silently downgraded.
+AES-128/192/256 CFB, CTR and OFB, RC4-MD5, RC4-MD5-6, ChaCha20-IETF, and `none`/`dummy`. Unsupported classic or AEAD methods are rejected during outbound construction.
 
 ## Ackwrap Mapping
 
-Ackwrap keeps `ssr` as the database and UI protocol name. Configuration
-generation converts it to the core type `shadowsocksr` and maps:
+Ackwrap keeps `ssr` as the database/UI name and maps it to `shadowsocksr`; `cipher` becomes `method`, hyphenated protocol/obfs parameters become underscore fields, and Clash `udp: false` becomes `network: tcp`.
 
-- `cipher` to `method`
-- `obfs-param` to `obfs_param`
-- `protocol-param` to `protocol_param`
-- Clash `udp: false` to `network: tcp`; true or omitted keeps TCP+UDP
+## Branch Safety
 
-Both SSR URI and Clash YAML imports use this mapping.
-
-## Known Limitations
-
-- SSR is a legacy protocol. New cipher, protocol, or obfs variants must be
-  added deliberately with interoperability tests.
-- Configuration validation proves schema and constructor support; a real
-  server is still required for protocol interoperability testing.
+`devel` is the merge boundary between upstream synchronization and Ackwrap changes. Commit and push core changes before the parent repository updates its submodule pointer. Never move a dirty submodule worktree during merge, pull, rebase, checkout, or submodule update.
 
 ## Verification
 
-Run from `sing-box-wrap`:
-
 ```bash
-go test ./protocol/shadowsocksr ./include
+go test ./transport/clashssr/... ./protocol/shadowsocksr ./include
 go build ./cmd/sing-box
-```
-
-Then validate a redacted configuration containing a `shadowsocksr` outbound:
-
-```bash
-sing-box check -c ssr-test.json
 ```
