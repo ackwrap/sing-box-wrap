@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	stdtls "crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -591,6 +592,66 @@ func TestWindowsClientHandshakeHonorsPublicKeyPinFailure(t *testing.T) {
 		clientConn.Close()
 		t.Fatal("expected public-key pin mismatch to fail")
 	}
+}
+
+func TestWindowsClientHandshakeHonorsCertificatePinSuccess(t *testing.T) {
+	serverCertificate, _ := newWindowsTestCertificate(t, "localhost")
+	pin := sha256.Sum256(serverCertificate.Certificate[0])
+	_, serverAddress := startWindowsTLSTestServer(t, &stdtls.Config{
+		Certificates: []stdtls.Certificate{serverCertificate},
+	})
+
+	clientConn, err := newWindowsTestClientConn(t, serverAddress, option.OutboundTLSOptions{
+		Enabled:           true,
+		Engine:            C.TLSEngineWindows,
+		ServerName:        "localhost",
+		Insecure:          true,
+		CertificateSHA256: []string{hex.EncodeToString(pin[:])},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+}
+
+func TestWindowsClientHandshakeHonorsCertificatePinFailure(t *testing.T) {
+	serverCertificate, _ := newWindowsTestCertificate(t, "localhost")
+	wrongPin := sha256.Sum256([]byte("not the certificate"))
+	_, serverAddress := startWindowsTLSTestServer(t, &stdtls.Config{
+		Certificates: []stdtls.Certificate{serverCertificate},
+	})
+
+	clientConn, err := newWindowsTestClientConn(t, serverAddress, option.OutboundTLSOptions{
+		Enabled:           true,
+		Engine:            C.TLSEngineWindows,
+		ServerName:        "localhost",
+		Insecure:          true,
+		CertificateSHA256: []string{hex.EncodeToString(wrongPin[:])},
+	})
+	if err == nil {
+		clientConn.Close()
+		t.Fatal("expected certificate pin mismatch to fail")
+	}
+}
+
+func TestWindowsClientHandshakeHonorsCertificatePinWithCustomCA(t *testing.T) {
+	serverCertificate, serverCertificatePEM := newWindowsTestCertificate(t, "localhost")
+	pin := sha256.Sum256(serverCertificate.Certificate[0])
+	_, serverAddress := startWindowsTLSTestServer(t, &stdtls.Config{
+		Certificates: []stdtls.Certificate{serverCertificate},
+	})
+
+	clientConn, err := newWindowsTestClientConn(t, serverAddress, option.OutboundTLSOptions{
+		Enabled:           true,
+		Engine:            C.TLSEngineWindows,
+		ServerName:        "localhost",
+		Certificate:       []string{serverCertificatePEM},
+		CertificateSHA256: []string{hex.EncodeToString(pin[:])},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
 }
 
 func TestWindowsClientHandshakeContextCancellation(t *testing.T) {

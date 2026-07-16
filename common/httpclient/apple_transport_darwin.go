@@ -96,6 +96,15 @@ type appleTransport struct {
 	closed  bool
 }
 
+func validateAppleTransport(ctx context.Context, options option.HTTPClientOptions) error {
+	sessionConfig, err := newAppleSessionConfig(ctx, options)
+	if err != nil {
+		return err
+	}
+	sessionConfig.close()
+	return nil
+}
+
 func newAppleTransport(ctx context.Context, logger logger.ContextLogger, rawDialer N.Dialer, options option.HTTPClientOptions) (innerTransport, error) {
 	sessionConfig, err := newAppleSessionConfig(ctx, options)
 	if err != nil {
@@ -108,6 +117,10 @@ func newAppleTransport(ctx context.Context, logger logger.ContextLogger, rawDial
 		}
 	}()
 	bridge, err := newAppleProxyBridge(ctx, logger, "apple http proxy", rawDialer)
+	if err != nil {
+		return nil, err
+	}
+	err = bridge.Start()
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +174,9 @@ func newAppleSessionConfig(ctx context.Context, options option.HTTPClientOptions
 	}
 	if len(tlsOptions.ALPN) > 0 {
 		return appleSessionConfig{}, E.New("tls.alpn is unsupported in Apple HTTP engine")
+	}
+	if len(tlsOptions.CertificateSHA256) > 0 {
+		return appleSessionConfig{}, E.New("tls.certificate_sha256 is unsupported in Apple HTTP engine")
 	}
 	validated, err := boxTLS.ValidateSystemTLSOptions(ctx, tlsOptions, "Apple HTTP engine")
 	if err != nil {

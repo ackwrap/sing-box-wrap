@@ -7,8 +7,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"net"
-	"os"
 	"strings"
 	"time"
 
@@ -20,6 +20,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/ntp"
+	"github.com/sagernet/sing/service/filemanager"
 )
 
 type STDClientConfig struct {
@@ -134,7 +135,18 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 	} else if options.DisableSNI {
 		tlsConfig.InsecureSkipVerify = true
 	}
-	if len(options.CertificatePublicKeySHA256) > 0 {
+	if len(options.CertificateSHA256) > 0 {
+		if len(options.CertificatePublicKeySHA256) > 0 {
+			return nil, E.New("certificate_sha256 is conflict with certificate_public_key_sha256")
+		}
+		certificateSHA256, err := ParseCertificateSHA256(options.CertificateSHA256)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			return VerifyCertificateSHA256(certificateSHA256, rawCerts)
+		}
+	} else if len(options.CertificatePublicKeySHA256) > 0 {
 		if len(options.Certificate) > 0 || options.CertificatePath != "" {
 			return nil, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
 		}
@@ -179,7 +191,7 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 	if len(options.Certificate) > 0 {
 		certificate = []byte(strings.Join(options.Certificate, "\n"))
 	} else if options.CertificatePath != "" {
-		content, err := os.ReadFile(options.CertificatePath)
+		content, err := filemanager.ReadFile(ctx, options.CertificatePath)
 		if err != nil {
 			return nil, E.Cause(err, "read certificate")
 		}
@@ -196,7 +208,7 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 	if len(options.ClientCertificate) > 0 {
 		clientCertificate = []byte(strings.Join(options.ClientCertificate, "\n"))
 	} else if options.ClientCertificatePath != "" {
-		content, err := os.ReadFile(options.ClientCertificatePath)
+		content, err := filemanager.ReadFile(ctx, options.ClientCertificatePath)
 		if err != nil {
 			return nil, E.Cause(err, "read client certificate")
 		}
@@ -206,7 +218,7 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 	if len(options.ClientKey) > 0 {
 		clientKey = []byte(strings.Join(options.ClientKey, "\n"))
 	} else if options.ClientKeyPath != "" {
-		content, err := os.ReadFile(options.ClientKeyPath)
+		content, err := filemanager.ReadFile(ctx, options.ClientKeyPath)
 		if err != nil {
 			return nil, E.Cause(err, "read client key")
 		}
@@ -276,6 +288,9 @@ func verifyConnection(rootCAs *x509.CertPool, timeFunc func() time.Time, serverN
 }
 
 func VerifyPublicKeySHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
+	if len(rawCerts) == 0 {
+		return E.New("missing remote certificate")
+	}
 	leafCertificate, err := x509.ParseCertificate(rawCerts[0])
 	if err != nil {
 		return E.Cause(err, "failed to parse leaf certificate")
@@ -292,4 +307,30 @@ func VerifyPublicKeySHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
 		}
 	}
 	return E.New("unrecognized remote public key: ", base64.StdEncoding.EncodeToString(hashValue[:]))
+}
+
+func ParseCertificateSHA256(values []string) ([][]byte, error) {
+	knownHashValues := make([][]byte, 0, len(values))
+	for _, value := range values {
+		normalized := strings.NewReplacer(":", "", "-", "").Replace(strings.TrimSpace(value))
+		hashValue, err := hex.DecodeString(normalized)
+		if err != nil || len(hashValue) != sha256.Size {
+			return nil, E.New("invalid certificate_sha256")
+		}
+		knownHashValues = append(knownHashValues, hashValue)
+	}
+	return knownHashValues, nil
+}
+
+func VerifyCertificateSHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
+	if len(rawCerts) == 0 {
+		return E.New("missing remote certificate")
+	}
+	hashValue := sha256.Sum256(rawCerts[0])
+	for _, value := range knownHashValues {
+		if bytes.Equal(value, hashValue[:]) {
+			return nil
+		}
+	}
+	return E.New("unrecognized remote certificate")
 }

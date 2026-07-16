@@ -8,7 +8,6 @@ import (
 	"crypto/x509"
 	"math/rand"
 	"net"
-	"os"
 	"strings"
 	"time"
 
@@ -21,6 +20,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/ntp"
+	"github.com/sagernet/sing/service/filemanager"
 
 	utls "github.com/metacubex/utls"
 	"golang.org/x/net/http2"
@@ -209,7 +209,18 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 			return nil, E.New("disable_sni is unsupported in reality")
 		}
 	}
-	if len(options.CertificatePublicKeySHA256) > 0 {
+	if len(options.CertificateSHA256) > 0 {
+		if len(options.CertificatePublicKeySHA256) > 0 {
+			return nil, E.New("certificate_sha256 is conflict with certificate_public_key_sha256")
+		}
+		certificateSHA256, err := ParseCertificateSHA256(options.CertificateSHA256)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			return VerifyCertificateSHA256(certificateSHA256, rawCerts)
+		}
+	} else if len(options.CertificatePublicKeySHA256) > 0 {
 		if len(options.Certificate) > 0 || options.CertificatePath != "" {
 			return nil, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
 		}
@@ -251,7 +262,7 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	if len(options.Certificate) > 0 {
 		certificate = []byte(strings.Join(options.Certificate, "\n"))
 	} else if options.CertificatePath != "" {
-		content, err := os.ReadFile(options.CertificatePath)
+		content, err := filemanager.ReadFile(ctx, options.CertificatePath)
 		if err != nil {
 			return nil, E.Cause(err, "read certificate")
 		}
@@ -268,7 +279,7 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	if len(options.ClientCertificate) > 0 {
 		clientCertificate = []byte(strings.Join(options.ClientCertificate, "\n"))
 	} else if options.ClientCertificatePath != "" {
-		content, err := os.ReadFile(options.ClientCertificatePath)
+		content, err := filemanager.ReadFile(ctx, options.ClientCertificatePath)
 		if err != nil {
 			return nil, E.Cause(err, "read client certificate")
 		}
@@ -278,7 +289,7 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	if len(options.ClientKey) > 0 {
 		clientKey = []byte(strings.Join(options.ClientKey, "\n"))
 	} else if options.ClientKeyPath != "" {
-		content, err := os.ReadFile(options.ClientKeyPath)
+		content, err := filemanager.ReadFile(ctx, options.ClientKeyPath)
 		if err != nil {
 			return nil, E.Cause(err, "read client key")
 		}
