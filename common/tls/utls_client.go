@@ -209,7 +209,18 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 			return nil, E.New("disable_sni is unsupported in reality")
 		}
 	}
-	if len(options.CertificatePublicKeySHA256) > 0 {
+	if len(options.CertificateSHA256) > 0 {
+		if len(options.CertificatePublicKeySHA256) > 0 {
+			return nil, E.New("certificate_sha256 is conflict with certificate_public_key_sha256")
+		}
+		certificateSHA256, err := ParseCertificateSHA256(options.CertificateSHA256)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			return VerifyCertificateSHA256(certificateSHA256, rawCerts)
+		}
+	} else if len(options.CertificatePublicKeySHA256) > 0 {
 		if len(options.Certificate) > 0 || options.CertificatePath != "" {
 			return nil, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
 		}

@@ -56,6 +56,9 @@ func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 }
 
 func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions, allowEmptyServerName bool) (Config, error) {
+	if len(options.CertificateSHA256) > 0 {
+		return nil, E.New("certificate_sha256 is unsupported in reality")
+	}
 	if options.UTLS == nil || !options.UTLS.Enabled {
 		return nil, E.New("uTLS is required by reality client")
 	}

@@ -175,6 +175,9 @@ func newAppleSessionConfig(ctx context.Context, options option.HTTPClientOptions
 	if len(tlsOptions.ALPN) > 0 {
 		return appleSessionConfig{}, E.New("tls.alpn is unsupported in Apple HTTP engine")
 	}
+	if len(tlsOptions.CertificateSHA256) > 0 {
+		return appleSessionConfig{}, E.New("tls.certificate_sha256 is unsupported in Apple HTTP engine")
+	}
 	validated, err := boxTLS.ValidateSystemTLSOptions(ctx, tlsOptions, "Apple HTTP engine")
 	if err != nil {
 		return appleSessionConfig{}, err

@@ -4,10 +4,14 @@ package tls
 
 import (
 	"context"
+	"crypto/sha256"
 	"net"
+	"strings"
 	"testing"
 
 	tf "github.com/sagernet/sing-box/common/tlsfragment"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/logger"
 
 	utls "github.com/metacubex/utls"
 	"github.com/stretchr/testify/require"
@@ -25,6 +29,16 @@ func newUTLSClientConfigForGateTest(fragment, recordFragment bool) *UTLSClientCo
 		id:             utls.HelloChrome_Auto,
 		fragment:       fragment,
 		recordFragment: recordFragment,
+	}
+}
+
+func TestRealityRejectsCertificateSHA256(t *testing.T) {
+	_, err := newRealityClient(context.Background(), logger.NOP(), "localhost", option.OutboundTLSOptions{
+		Enabled:           true,
+		CertificateSHA256: []string{strings.Repeat("00", sha256.Size)},
+	}, false)
+	if err == nil || !strings.Contains(err.Error(), "certificate_sha256") {
+		t.Fatalf("expected reality certificate pin error, got %v", err)
 	}
 }
 

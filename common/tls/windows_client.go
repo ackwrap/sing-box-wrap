@@ -108,6 +108,12 @@ func (c *windowsClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 			return nil, err
 		}
 	}
+	if len(c.certificateSHA256) > 0 {
+		err = VerifyCertificateSHA256(c.certificateSHA256, rawCerts)
+		if err != nil {
+			return nil, err
+		}
+	}
 	header, trailer, maxMessage, err := client.StreamSizes()
 	if err != nil {
 		return nil, err

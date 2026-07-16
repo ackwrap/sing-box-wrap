@@ -14,11 +14,12 @@ import (
 )
 
 type SystemTLSValidated struct {
-	MinVersion uint16
-	MaxVersion uint16
-	UserPEM    []byte
-	Exclusive  bool
-	Store      adapter.CertificateStore
+	MinVersion        uint16
+	MaxVersion        uint16
+	UserPEM           []byte
+	Exclusive         bool
+	Store             adapter.CertificateStore
+	CertificateSHA256 [][]byte
 }
 
 func ValidateSystemTLSOptions(ctx context.Context, options option.OutboundTLSOptions, engineName string) (SystemTLSValidated, error) {
@@ -52,8 +53,15 @@ func ValidateSystemTLSOptions(ctx context.Context, options option.OutboundTLSOpt
 	if options.Spoof != "" || options.SpoofMethod != "" {
 		return SystemTLSValidated{}, E.New("spoof is unsupported in ", engineName)
 	}
+	if len(options.CertificateSHA256) > 0 && len(options.CertificatePublicKeySHA256) > 0 {
+		return SystemTLSValidated{}, E.New("certificate_sha256 is conflict with certificate_public_key_sha256")
+	}
 	if len(options.CertificatePublicKeySHA256) > 0 && (len(options.Certificate) > 0 || options.CertificatePath != "") {
 		return SystemTLSValidated{}, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
+	}
+	certificateSHA256, err := ParseCertificateSHA256(options.CertificateSHA256)
+	if err != nil {
+		return SystemTLSValidated{}, err
 	}
 	var minVersion uint16
 	if options.MinVersion != "" {
@@ -76,11 +84,12 @@ func ValidateSystemTLSOptions(ctx context.Context, options option.OutboundTLSOpt
 		return SystemTLSValidated{}, err
 	}
 	return SystemTLSValidated{
-		MinVersion: minVersion,
-		MaxVersion: maxVersion,
-		UserPEM:    userPEM,
-		Exclusive:  exclusive,
-		Store:      store,
+		MinVersion:        minVersion,
+		MaxVersion:        maxVersion,
+		UserPEM:           userPEM,
+		Exclusive:         exclusive,
+		Store:             store,
+		CertificateSHA256: certificateSHA256,
 	}, nil
 }
 
