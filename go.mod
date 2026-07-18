@@ -43,11 +43,11 @@ require (
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a
 	github.com/sagernet/nftables v0.3.0-mod.4
 	github.com/sagernet/quic-go v0.59.0-sing-box-mod.4
-	github.com/sagernet/sing v0.8.12-0.20260717023913-84ab32b56cb8
+	github.com/sagernet/sing v0.8.12-0.20260717153536-4f1ed45a99a5
 	github.com/sagernet/sing-cloudflared v0.1.3-0.20260706062323-d9787e794aa3
 	github.com/sagernet/sing-mux v0.3.5
 	github.com/sagernet/sing-openconnect v0.0.0-20260717081856-cf2c71a71aba
-	github.com/sagernet/sing-openvpn v0.0.0-20260717092601-0db6ebb53109
+	github.com/sagernet/sing-openvpn v0.0.0-20260718013246-3cd8a7b83247
 	github.com/sagernet/sing-quic v0.6.4-0.20260709034545-e23afe1172dc
 	github.com/sagernet/sing-shadowsocks v0.2.8
 	github.com/sagernet/sing-shadowsocks2 v0.2.1
@@ -57,7 +57,7 @@ require (
 	github.com/sagernet/sing-usbip v0.0.0-20260616101517-efb91521eddb
 	github.com/sagernet/sing-vmess v0.2.8-0.20250909125414-3aed155119a1
 	github.com/sagernet/smux v1.5.50-sing-box-mod.1
-	github.com/sagernet/tailscale v1.92.4-sing-box-1.13-mod.7.0.20260717024045-1edfbb9ee544
+	github.com/sagernet/tailscale v1.92.4-sing-box-1.13-mod.7.0.20260717155615-b353b93d194a
 	github.com/sagernet/wireguard-go v0.0.5-0.20260717024847-6f5e8b1947ae
 	github.com/sagernet/ws v0.0.0-20231204124109-acfe8907c854
 	github.com/spf13/cobra v1.10.2
