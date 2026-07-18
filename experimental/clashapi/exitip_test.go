@@ -152,3 +152,28 @@ func TestOutboundExitIPTimeoutClassification(t *testing.T) {
 		t.Fatal("ordinary outbound error must not be classified as timeout")
 	}
 }
+
+func TestDescribeOutboundExitIPErrorReturnsStableStages(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStage  string
+		wantStatus int
+	}{
+		{name: "connect", err: wrapOutboundExitIPError("outbound_connect", errors.New("sensitive upstream error")), wantStage: "outbound_connect", wantStatus: http.StatusBadGateway},
+		{name: "http", err: wrapOutboundExitIPError("http_status", errors.New("HTTP 503")), wantStage: "http_status", wantStatus: http.StatusBadGateway},
+		{name: "invalid response", err: wrapOutboundExitIPError("invalid_response", errors.New("invalid")), wantStage: "invalid_response", wantStatus: http.StatusBadGateway},
+		{name: "timeout", err: context.DeadlineExceeded, wantStage: "timeout", wantStatus: http.StatusGatewayTimeout},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stage, message, status := describeOutboundExitIPError(context.Background(), test.err)
+			if stage != test.wantStage || status != test.wantStatus || message == "" {
+				t.Fatalf("describe error = (%q, %q, %d), want stage=%q status=%d", stage, message, status, test.wantStage, test.wantStatus)
+			}
+			if strings.Contains(message, "sensitive upstream error") {
+				t.Fatalf("response exposed underlying error: %q", message)
+			}
+		})
+	}
+}
