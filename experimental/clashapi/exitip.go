@@ -56,14 +56,10 @@ func getProxyExitIP(server *Server) func(http.ResponseWriter, *http.Request) {
 		server.logger.Info("outbound exit IP check started: ", proxy.Tag())
 		ip, err := lookupOutboundExitIP(ctx, proxy, ipv6)
 		if err != nil {
-			server.logger.Warn("outbound exit IP check failed: ", proxy.Tag())
-			if isOutboundExitIPTimeout(ctx, err) {
-				render.Status(request, http.StatusGatewayTimeout)
-				render.JSON(writer, request, newError("Exit IP lookup timed out"))
-				return
-			}
-			render.Status(request, http.StatusBadGateway)
-			render.JSON(writer, request, newError("Unable to query exit IP through outbound"))
+			stage, message, status := describeOutboundExitIPError(ctx, err)
+			server.logger.Warn("outbound exit IP check failed stage=", stage, ": ", proxy.Tag())
+			render.Status(request, status)
+			render.JSON(writer, request, render.M{"message": message, "stage": stage})
 			return
 		}
 		server.logger.Info("outbound exit IP check completed: ", proxy.Tag())
@@ -71,6 +67,51 @@ func getProxyExitIP(server *Server) func(http.ResponseWriter, *http.Request) {
 			"ip":         ip.String(),
 			"ip_version": map[bool]int{false: 4, true: 6}[ipv6],
 		})
+	}
+}
+
+type outboundExitIPStageError struct {
+	stage string
+	err   error
+}
+
+func (e *outboundExitIPStageError) Error() string {
+	return e.err.Error()
+}
+
+func (e *outboundExitIPStageError) Unwrap() error {
+	return e.err
+}
+
+func wrapOutboundExitIPError(stage string, err error) error {
+	return &outboundExitIPStageError{stage: stage, err: err}
+}
+
+func describeOutboundExitIPError(ctx context.Context, err error) (string, string, int) {
+	if isOutboundExitIPTimeout(ctx, err) {
+		return "timeout", "Exit IP lookup timed out", http.StatusGatewayTimeout
+	}
+	stage := "outbound_connect"
+	var stageError *outboundExitIPStageError
+	if errors.As(err, &stageError) {
+		stage = stageError.stage
+	}
+	switch stage {
+	case "http_status":
+		if stageError != nil {
+			return stage, stageError.err.Error(), http.StatusBadGateway
+		}
+		return stage, "Exit IP service returned an unsuccessful HTTP status", http.StatusBadGateway
+	case "read_response":
+		return stage, "Unable to read the exit IP service response", http.StatusBadGateway
+	case "response_too_large":
+		return stage, "Exit IP service response exceeded the size limit", http.StatusBadGateway
+	case "invalid_response":
+		return stage, "Exit IP service returned an invalid response", http.StatusBadGateway
+	case "address_family":
+		return stage, "Exit IP service returned an unexpected address family", http.StatusBadGateway
+	default:
+		return "outbound_connect", "Outbound could not connect to the exit IP service", http.StatusBadGateway
 	}
 }
 
@@ -127,25 +168,25 @@ func fetchOutboundExitIP(ctx context.Context, link string, detour N.Dialer, ipv6
 	request.Header.Set("User-Agent", "sing-box/ackwrap")
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, err
+		return nil, wrapOutboundExitIPError("outbound_connect", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("exit IP service returned HTTP %d", response.StatusCode)
+		return nil, wrapOutboundExitIPError("http_status", fmt.Errorf("exit IP service returned HTTP %d", response.StatusCode))
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, outboundExitIPBodyLimit+1))
 	if err != nil {
-		return nil, err
+		return nil, wrapOutboundExitIPError("read_response", err)
 	}
 	if len(body) > outboundExitIPBodyLimit {
-		return nil, errors.New("exit IP response exceeds 64 KiB")
+		return nil, wrapOutboundExitIPError("response_too_large", errors.New("exit IP response exceeds 64 KiB"))
 	}
 	ip, err := parseOutboundExitIP(string(body))
 	if err != nil {
-		return nil, err
+		return nil, wrapOutboundExitIPError("invalid_response", err)
 	}
 	if ipv6 == (ip.To4() != nil) {
-		return nil, errors.New("exit IP service returned an unexpected address family")
+		return nil, wrapOutboundExitIPError("address_family", errors.New("exit IP service returned an unexpected address family"))
 	}
 	return ip, nil
 }
