@@ -9,6 +9,7 @@ import (
 	"github.com/sagernet/sing-openconnect"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	N "github.com/sagernet/sing/common/network"
@@ -36,15 +37,20 @@ type Device interface {
 }
 
 type DeviceOptions struct {
-	Context       context.Context
-	Logger        logger.ContextLogger
-	System        bool
-	Handler       tun.Handler
-	UDPTimeout    time.Duration
-	ICMPTimeout   time.Duration
-	Name          string
-	MTU           uint32
-	Configuration Configuration
+	Context          context.Context
+	Logger           logger.ContextLogger
+	System           bool
+	Handler          tun.Handler
+	UDPTimeout       time.Duration
+	ICMPTimeout      time.Duration
+	UDPMapping       tun.NATMapping
+	UDPFiltering     tun.NATFiltering
+	UDPNATMax        uint32
+	InterfaceFinder  control.InterfaceFinder
+	ExcludeInterface []string
+	Name             string
+	MTU              uint32
+	Configuration    Configuration
 }
 
 type Configuration struct {
@@ -98,7 +104,7 @@ func (d *baseDevice) SetPacketWriter(writer PacketWriter) {
 func (d *baseDevice) writeOutbound(packetBuffers []*buf.Buffer) error {
 	if d.packetWriter == nil {
 		buf.ReleaseMulti(packetBuffers)
-		return E.New("missing OpenConnect packet writer")
+		return E.New("missing packet writer")
 	}
 	return d.packetWriter(packetBuffers)
 }

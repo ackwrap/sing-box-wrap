@@ -98,10 +98,15 @@ func (m *Manager) Get(tag string) (adapter.Inbound, bool) {
 
 func (m *Manager) Remove(tag string) error {
 	m.access.Lock()
+	defer m.access.Unlock()
 	inbound, found := m.inboundByTag[tag]
 	if !found {
-		m.access.Unlock()
 		return os.ErrInvalid
+	}
+	if m.started {
+		if err := inbound.Close(); err != nil {
+			return err
+		}
 	}
 	delete(m.inboundByTag, tag)
 	index := common.Index(m.inbounds, func(it adapter.Inbound) bool {
@@ -111,11 +116,6 @@ func (m *Manager) Remove(tag string) error {
 		panic("invalid inbound index")
 	}
 	m.inbounds = append(m.inbounds[:index], m.inbounds[index+1:]...)
-	started := m.started
-	m.access.Unlock()
-	if started {
-		return inbound.Close()
-	}
 	return nil
 }
 
@@ -133,7 +133,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 			err = adapter.LegacyStart(inbound, stage)
 			done()
 			if err != nil {
-				return E.Cause(err, stage, " ", name)
+				return E.Append(E.Cause(err, stage, " ", name), common.Close(inbound), func(closeErr error) error {
+					return E.Cause(closeErr, "close failed ", name)
+				})
 			}
 		}
 	}

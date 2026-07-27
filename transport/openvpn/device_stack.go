@@ -37,6 +37,7 @@ type stackDevice struct {
 	endpoint        *stackEndpoint
 	inet4Address    netip.Addr
 	inet6Address    netip.Addr
+	udpForwarder    *tun.UDPForwarder
 	icmpForwarder   *tun.ICMPForwarder
 	logRouteOptions bool
 	closeOnce       sync.Once
@@ -68,9 +69,17 @@ func newStackDevice(options DeviceOptions) (*stackDevice, error) {
 	}
 	if options.Handler != nil {
 		ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, tun.NewTCPForwarder(options.Context, ipStack, options.Handler).HandlePacket)
-		ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, tun.NewUDPForwarder(options.Context, ipStack, options.Handler, tun.UDPNatOptions{
-			Timeout: options.UDPTimeout,
-		}).HandlePacket)
+		udpForwarder := tun.NewUDPForwarder(options.Context, ipStack, options.Handler, tun.UDPNatOptions{
+			Timeout:          options.UDPTimeout,
+			Shared:           true,
+			Mapping:          options.UDPMapping,
+			Filtering:        options.UDPFiltering,
+			MaxSize:          options.UDPNATMax,
+			InterfaceFinder:  options.InterfaceFinder,
+			ExcludeInterface: options.ExcludeInterface,
+		})
+		ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
+		device.udpForwarder = udpForwarder
 		icmpForwarder := tun.NewICMPForwarder(ipStack, options.Handler, options.Logger)
 		ipStack.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
 		ipStack.SetTransportProtocolHandler(icmp.ProtocolNumber6, icmpForwarder.HandlePacket)
@@ -80,6 +89,12 @@ func newStackDevice(options DeviceOptions) (*stackDevice, error) {
 }
 
 func (d *stackDevice) Start() error {
+	if d.udpForwarder != nil {
+		err := d.udpForwarder.Start()
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -87,7 +102,8 @@ func (d *stackDevice) UpdateConfiguration(configuration Configuration) error {
 	d.stateAccess.Lock()
 	defer d.stateAccess.Unlock()
 	if d.logRouteOptions && hasRouteOptions(configuration.Routes) {
-		d.options.Logger.Debug("OpenVPN route gateway and metric options are not representable by the gVisor stack device; routes are installed by prefix")
+		d.options.Logger.Debug("route gateway and metric options are not representable by the gVisor stack device; routes are installed by prefix")
+		d.logRouteOptions = false
 	}
 	if configuration.MTU != 0 {
 		d.options.MTU = configuration.MTU
@@ -168,7 +184,7 @@ func (d *stackDevice) writeBuffers(packetBuffers []*buf.Buffer) error {
 
 func (d *stackDevice) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if destination.IsIPv6() && d.blockIPv6Enabled() {
-		return nil, E.New("IPv6 blocked by pushed OpenVPN block-ipv6")
+		return nil, E.New("IPv6 blocked by pushed block-ipv6")
 	}
 	inet4Address, inet6Address := d.PortAddresses()
 	address := tcpip.FullAddress{
@@ -205,7 +221,7 @@ func (d *stackDevice) DialContext(ctx context.Context, network string, destinati
 
 func (d *stackDevice) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if destination.IsIPv6() && d.blockIPv6Enabled() {
-		return nil, E.New("IPv6 blocked by pushed OpenVPN block-ipv6")
+		return nil, E.New("IPv6 blocked by pushed block-ipv6")
 	}
 	inet4Address, inet6Address := d.PortAddresses()
 	bind := tcpip.FullAddress{
@@ -249,6 +265,9 @@ func (d *stackDevice) PortMTU() uint32 {
 func (d *stackDevice) Close() error {
 	d.closeOnce.Do(func() {
 		close(d.endpoint.done)
+		if d.udpForwarder != nil {
+			d.udpForwarder.Close()
+		}
 		if d.icmpForwarder != nil {
 			d.icmpForwarder.Close()
 		}

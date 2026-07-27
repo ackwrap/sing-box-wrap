@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -25,29 +26,31 @@ import (
 var _ adapter.Router = (*Router)(nil)
 
 type Router struct {
-	ctx               context.Context
-	logger            log.ContextLogger
-	inbound           adapter.InboundManager
-	outbound          adapter.OutboundManager
-	dns               adapter.DNSRouter
-	dnsTransport      adapter.DNSTransportManager
-	connection        adapter.ConnectionManager
-	network           adapter.NetworkManager
-	httpClientManager adapter.HTTPClientManager
-	rules             []adapter.Rule
-	needFindProcess   bool
-	needFindNeighbor  bool
-	leaseFiles        []string
-	ruleSets          []adapter.RuleSet
-	ruleSetMap        map[string]adapter.RuleSet
-	ruleSetUpdater    *R.RuleSetUpdater
-	processSearcher   process.Searcher
-	processCache      *freelru.Cache[processCacheKey, processCacheEntry]
-	neighborResolver  adapter.NeighborResolver
-	pauseManager      pause.Manager
-	trackers          []adapter.ConnectionTracker
-	platformInterface adapter.PlatformInterface
-	started           bool
+	ctx                context.Context
+	logger             log.ContextLogger
+	inbound            adapter.InboundManager
+	outbound           adapter.OutboundManager
+	dns                adapter.DNSRouter
+	dnsTransport       adapter.DNSTransportManager
+	connection         adapter.ConnectionManager
+	network            adapter.NetworkManager
+	httpClientManager  adapter.HTTPClientManager
+	rules              []adapter.Rule
+	needFindProcess    bool
+	needFindNeighbor   bool
+	leaseFiles         []string
+	ruleSets           []adapter.RuleSet
+	ruleSetMap         map[string]adapter.RuleSet
+	ruleSetUpdater     *R.RuleSetUpdater
+	processSearcher    process.Searcher
+	processCache       *freelru.Cache[processCacheKey, processCacheEntry]
+	neighborResolver   adapter.NeighborResolver
+	pauseManager       pause.Manager
+	trackers           []adapter.ConnectionTracker
+	platformInterface  adapter.PlatformInterface
+	runtimeRouteAccess sync.RWMutex
+	runtimeOutbounds   map[string]string
+	started            bool
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {
@@ -63,12 +66,32 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 		httpClientManager: service.FromContext[adapter.HTTPClientManager](ctx),
 		rules:             make([]adapter.Rule, 0, len(options.Rules)),
 		ruleSetMap:        make(map[string]adapter.RuleSet),
+		runtimeOutbounds:  make(map[string]string),
 		needFindProcess:   hasRule(options.Rules, isProcessRule) || hasDNSRule(dnsOptions.Rules, isProcessDNSRule) || options.FindProcess,
 		needFindNeighbor:  hasRule(options.Rules, isNeighborRule) || hasDNSRule(dnsOptions.Rules, isNeighborDNSRule) || hasLocalNeighborDNSServer(dnsOptions.Servers) || options.FindNeighbor,
 		leaseFiles:        options.DHCPLeaseFiles,
 		pauseManager:      service.FromContext[pause.Manager](ctx),
 		platformInterface: service.FromContext[adapter.PlatformInterface](ctx),
 	}
+}
+
+func (r *Router) SetRuntimeInboundOutbound(inboundTag string, outboundTag string) {
+	r.runtimeRouteAccess.Lock()
+	r.runtimeOutbounds[inboundTag] = outboundTag
+	r.runtimeRouteAccess.Unlock()
+}
+
+func (r *Router) RemoveRuntimeInboundOutbound(inboundTag string) {
+	r.runtimeRouteAccess.Lock()
+	delete(r.runtimeOutbounds, inboundTag)
+	r.runtimeRouteAccess.Unlock()
+}
+
+func (r *Router) runtimeInboundOutbound(inboundTag string) (string, bool) {
+	r.runtimeRouteAccess.RLock()
+	outboundTag, loaded := r.runtimeOutbounds[inboundTag]
+	r.runtimeRouteAccess.RUnlock()
+	return outboundTag, loaded
 }
 
 func (r *Router) Initialize(rules []option.Rule, ruleSets []option.RuleSet) error {
@@ -288,4 +311,10 @@ func (r *Router) NeighborResolver() adapter.NeighborResolver {
 func (r *Router) ResetNetwork() {
 	r.httpClientManager.ResetNetwork()
 	r.dns.ResetNetwork()
+	if r.processCache != nil {
+		r.processCache.Purge()
+	}
+	if r.processSearcher != nil {
+		r.processSearcher.ResetCache()
+	}
 }

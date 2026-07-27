@@ -39,6 +39,7 @@ type Service struct {
 	grpcServer     *grpc.Server
 	httpServer     *http.Server
 	dashboard      *dashboard
+	runtimeAPI     *runtimeAPI
 }
 
 func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.APIServiceOptions) (adapter.Service, error) {
@@ -67,6 +68,9 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 	if options.Dashboard != nil && options.Dashboard.Enabled {
 		s.dashboard = newDashboard(ctx, logger, *options.Dashboard)
 	}
+	if options.Secret != "" {
+		s.runtimeAPI = newRuntimeAPI(ctx, logger, options.Secret)
+	}
 	return s, nil
 }
 
@@ -83,7 +87,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		}
 	}
 	s.httpServer = &http.Server{
-		Handler: h2c.NewHandler(newHTTPHandler(s.logger, s.grpcServer, s.options, s.dashboard), new(http2.Server)),
+		Handler: h2c.NewHandler(newHTTPHandler(s.logger, s.grpcServer, s.options, s.dashboard, s.runtimeAPI), new(http2.Server)),
 		BaseContext: func(net.Listener) context.Context {
 			return s.ctx
 		},
@@ -117,12 +121,20 @@ func (s *Service) Start(stage adapter.StartStage) error {
 }
 
 func (s *Service) Close() error {
+	var err error
+	if s.httpServer != nil {
+		err = E.Append(err, s.httpServer.Close(), func(err error) error {
+			return E.Cause(err, "close HTTP server")
+		})
+	}
+	if s.runtimeAPI != nil {
+		err = E.Append(err, s.runtimeAPI.Close(), func(err error) error {
+			return E.Cause(err, "close runtime API")
+		})
+	}
 	s.cancel()
 	if s.dashboard != nil {
 		s.dashboard.close()
-	}
-	if s.httpServer != nil {
-		s.httpServer.Close()
 	}
 	if s.grpcServer != nil {
 		s.grpcServer.Stop()
@@ -130,8 +142,9 @@ func (s *Service) Close() error {
 	if s.startedService != nil {
 		s.startedService.Close()
 	}
-	return common.Close(
+	err = E.Append(err, common.Close(
 		common.PtrOrNil(s.listener),
 		s.tlsConfig,
-	)
+	), func(closeErr error) error { return closeErr })
+	return err
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/deprecated"
+	"github.com/sagernet/sing-box/experimental/locale"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing/common"
@@ -187,7 +188,7 @@ func (s *StartedService) waitForStarted(ctx context.Context) error {
 	}
 }
 
-func (s *StartedService) StartOrReloadService(profileContent string, options *OverrideOptions) error {
+func (s *StartedService) StartOrReloadService(ctx context.Context, profileContent string, options *OverrideOptions) error {
 	s.serviceAccess.Lock()
 	switch s.serviceStatus.Status {
 	case ServiceStatus_IDLE, ServiceStatus_STARTED, ServiceStatus_STARTING, ServiceStatus_FATAL:
@@ -206,7 +207,7 @@ func (s *StartedService) StartOrReloadService(profileContent string, options *Ov
 	}
 	s.updateStatus(ServiceStatus_STARTING)
 	s.resetLogs()
-	instance, err := s.newInstance(profileContent, options)
+	instance, err := s.newInstance(ctx, profileContent, options)
 	if err != nil {
 		return s.updateStatusError(err)
 	}
@@ -608,21 +609,17 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 	}
 	boxService := s.instance
 	s.serviceAccess.RUnlock()
-	groupTag := request.OutboundTag
-	abstractOutboundGroup, isLoaded := boxService.outboundManager.Outbound(groupTag)
+	outboundTag := request.OutboundTag
+	outbound, isLoaded := boxService.outboundManager.Outbound(outboundTag)
 	if !isLoaded {
-		return nil, status.Error(codes.NotFound, "outbound group not found: "+groupTag)
+		return nil, status.Error(codes.NotFound, "outbound not found: "+outboundTag)
 	}
-	outboundGroup, isOutboundGroup := abstractOutboundGroup.(adapter.OutboundGroup)
-	if !isOutboundGroup {
-		return nil, status.Error(codes.InvalidArgument, "outbound is not a group: "+groupTag)
-	}
-	urlTest, isURLTest := abstractOutboundGroup.(*group.URLTest)
+	historyStorage := boxService.urlTestHistoryStorage
+	urlTest, isURLTest := outbound.(*group.URLTest)
+	outboundGroup, isOutboundGroup := outbound.(adapter.OutboundGroup)
 	if isURLTest {
 		go urlTest.CheckOutbounds()
-	} else {
-		historyStorage := boxService.urlTestHistoryStorage
-
+	} else if isOutboundGroup {
 		outbounds := common.Filter(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
 			itOutbound, _ := boxService.outboundManager.Outbound(it)
 			return itOutbound
@@ -636,13 +633,13 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 		b, _ := batch.New(boxService.ctx, batch.WithConcurrencyNum[any](10))
 		for _, detour := range outbounds {
 			outboundToTest := detour
-			outboundTag := outboundToTest.Tag()
-			b.Go(outboundTag, func() (any, error) {
+			itemTag := outboundToTest.Tag()
+			b.Go(itemTag, func() (any, error) {
 				t, err := urltest.URLTest(boxService.ctx, "", outboundToTest)
 				if err != nil {
-					historyStorage.DeleteURLTestHistory(outboundTag)
+					historyStorage.DeleteURLTestHistory(itemTag)
 				} else {
-					historyStorage.StoreURLTestHistory(outboundTag, &adapter.URLTestHistory{
+					historyStorage.StoreURLTestHistory(itemTag, &adapter.URLTestHistory{
 						Time:  time.Now(),
 						Delay: t,
 					})
@@ -650,6 +647,18 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 				return nil, nil
 			})
 		}
+	} else {
+		go func() {
+			t, err := urltest.URLTest(boxService.ctx, "", outbound)
+			if err != nil {
+				historyStorage.DeleteURLTestHistory(outboundTag)
+			} else {
+				historyStorage.StoreURLTestHistory(outboundTag, &adapter.URLTestHistory{
+					Time:  time.Now(),
+					Delay: t,
+				})
+			}
+		}()
 	}
 	return &emptypb.Empty{}, nil
 }
@@ -1036,10 +1045,11 @@ func (s *StartedService) GetDeprecatedWarnings(ctx context.Context, empty *empty
 		return &DeprecatedWarnings{}, nil
 	}
 	notes := manager.Get()
+	selectedLocale := locale.FromContext(ctx)
 	return &DeprecatedWarnings{
 		Warnings: common.Map(notes, func(it deprecated.Note) *DeprecatedWarning {
 			return &DeprecatedWarning{
-				Message:           it.Message(),
+				Message:           it.MessageForLocale(selectedLocale),
 				Impending:         it.Impending(),
 				MigrationLink:     it.MigrationLink,
 				Description:       it.Description,
@@ -1410,6 +1420,7 @@ func (s *StartedService) SubscribeTailscaleStatus(
 
 	var tags []string
 	statuses := make(map[string]*adapter.TailscaleEndpointStatus, len(endpoints))
+	selectedLocale := locale.FromContext(server.Context())
 	for update := range updates {
 		if _, exists := statuses[update.tag]; !exists {
 			tags = append(tags, update.tag)
@@ -1417,7 +1428,7 @@ func (s *StartedService) SubscribeTailscaleStatus(
 		statuses[update.tag] = update.status
 		protoEndpoints := make([]*TailscaleEndpointStatus, 0, len(statuses))
 		for _, tag := range tags {
-			protoEndpoints = append(protoEndpoints, tailscaleEndpointStatusToProto(tag, statuses[tag]))
+			protoEndpoints = append(protoEndpoints, tailscaleEndpointStatusToProto(tag, statuses[tag], selectedLocale))
 		}
 		sendErr := server.Send(&TailscaleStatusUpdate{
 			Endpoints: protoEndpoints,
@@ -1429,7 +1440,7 @@ func (s *StartedService) SubscribeTailscaleStatus(
 	return nil
 }
 
-func tailscaleEndpointStatusToProto(tag string, s *adapter.TailscaleEndpointStatus) *TailscaleEndpointStatus {
+func tailscaleEndpointStatusToProto(tag string, s *adapter.TailscaleEndpointStatus, selectedLocale *locale.Locale) *TailscaleEndpointStatus {
 	userGroups := make([]*TailscaleUserGroup, len(s.UserGroups))
 	for i, group := range s.UserGroups {
 		peers := make([]*TailscalePeer, len(group.Peers))
@@ -1447,6 +1458,7 @@ func tailscaleEndpointStatusToProto(tag string, s *adapter.TailscaleEndpointStat
 	result := &TailscaleEndpointStatus{
 		EndpointTag:    tag,
 		BackendState:   s.BackendState,
+		StateText:      selectedLocale.TailscaleStateText(s.BackendState),
 		AuthURL:        s.AuthURL,
 		NetworkName:    s.NetworkName,
 		MagicDNSSuffix: s.MagicDNSSuffix,
@@ -1599,51 +1611,67 @@ func (s *StartedService) SubscribeOpenConnectStatus(
 	s.serviceAccess.RUnlock()
 
 	endpointManager := service.FromContext[adapter.EndpointManager](boxService.ctx)
+	selectedLocale := locale.FromContext(server.Context())
 	return subscribeEndpointStatus(server.Context(), endpointManager, C.TypeOpenConnect, "OpenConnect client", func(endpoints []adapter.OpenConnectEndpoint) error {
 		return server.Send(&OpenConnectStatusUpdate{
 			Endpoints: common.Map(endpoints, func(endpoint adapter.OpenConnectEndpoint) *OpenConnectEndpointStatus {
-				return openConnectEndpointStatusToProto(endpoint.Tag(), endpoint.OpenConnectStatus())
+				return openConnectEndpointStatusToProto(endpoint.Tag(), endpoint.OpenConnectStatus(), selectedLocale)
 			}),
 		})
 	})
 }
 
-func openConnectEndpointStatusToProto(tag string, endpointStatus adapter.OpenConnectStatus) *OpenConnectEndpointStatus {
+func openConnectEndpointStatusToProto(tag string, endpointStatus adapter.OpenConnectStatus, selectedLocale *locale.Locale) *OpenConnectEndpointStatus {
 	result := &OpenConnectEndpointStatus{
 		EndpointTag: tag,
 		State:       endpointStatus.State,
+		StateText:   selectedLocale.VPNStateText(endpointStatus.State),
 		Error:       endpointStatus.Error,
 		TunnelInfo:  openConnectTunnelInfoToProto(endpointStatus.TunnelInfo),
 	}
-	if endpointStatus.AuthForm != nil {
-		fields := common.Map(endpointStatus.AuthForm.Fields, func(field adapter.OpenConnectAuthFormField) *OpenConnectAuthFormField {
-			return &OpenConnectAuthFormField{
-				SubmissionKey: field.SubmissionKey,
-				Name:          field.Name,
-				Label:         field.Label,
-				Kind:          field.Kind,
-				Value:         field.Value,
-				Options: common.Map(field.Options, func(option adapter.OpenConnectAuthFormChoice) *OpenConnectAuthFormChoice {
-					return &OpenConnectAuthFormChoice{
-						Value: option.Value,
-						Label: option.Label,
+	if endpointStatus.AuthChallenge != nil {
+		challenge := &OpenConnectAuthChallenge{
+			Id:      endpointStatus.AuthChallenge.ID,
+			Banner:  endpointStatus.AuthChallenge.Banner,
+			Message: endpointStatus.AuthChallenge.Message,
+			Error:   endpointStatus.AuthChallenge.Error,
+		}
+		if endpointStatus.AuthChallenge.Form != nil {
+			challenge.Challenge = &OpenConnectAuthChallenge_Form{Form: &OpenConnectAuthForm{
+				Fields: common.Map(endpointStatus.AuthChallenge.Form.Fields, func(field adapter.OpenConnectAuthFormField) *OpenConnectAuthFormField {
+					return &OpenConnectAuthFormField{
+						SubmissionKey: field.SubmissionKey,
+						Name:          field.Name,
+						Label:         field.Label,
+						Kind:          field.Kind,
+						Value:         field.Value,
+						Options: common.Map(field.Options, func(option adapter.OpenConnectAuthFormChoice) *OpenConnectAuthFormChoice {
+							return &OpenConnectAuthFormChoice{
+								Value: option.Value,
+								Label: option.Label,
+							}
+						}),
 					}
 				}),
-			}
-		})
-		result.AuthForm = &OpenConnectAuthForm{
-			Id:      endpointStatus.AuthForm.ID,
-			Banner:  endpointStatus.AuthForm.Banner,
-			Message: endpointStatus.AuthForm.Message,
-			Error:   endpointStatus.AuthForm.Error,
-			Url:     endpointStatus.AuthForm.URL,
-			Fields:  fields,
+			}}
 		}
+		if endpointStatus.AuthChallenge.Browser != nil {
+			challenge.Challenge = &OpenConnectAuthChallenge_Browser{Browser: &OpenConnectBrowserRequest{
+				Url:                 endpointStatus.AuthChallenge.Browser.URL,
+				FinalURL:            endpointStatus.AuthChallenge.Browser.FinalURL,
+				CookieNames:         endpointStatus.AuthChallenge.Browser.CookieNames,
+				EarlyCookieNames:    endpointStatus.AuthChallenge.Browser.EarlyCookieNames,
+				HeaderNames:         endpointStatus.AuthChallenge.Browser.HeaderNames,
+				CallbackURLPrefixes: endpointStatus.AuthChallenge.Browser.CallbackURLPrefixes,
+				CacheID:             endpointStatus.AuthChallenge.Browser.CacheID,
+			}}
+		}
+		result.AuthChallenge = challenge
 	}
 	return result
 }
 
-func (s *StartedService) SubmitOpenConnectAuthForm(ctx context.Context, request *OpenConnectAuthFormSubmission) (*emptypb.Empty, error) {
+func (s *StartedService) SubmitOpenConnectAuthResponse(ctx context.Context, request *OpenConnectAuthResponseSubmission) (*emptypb.Empty, error) {
 	err := s.waitForStarted(ctx)
 	if err != nil {
 		return nil, err
@@ -1656,14 +1684,31 @@ func (s *StartedService) SubmitOpenConnectAuthForm(ctx context.Context, request 
 	if err != nil {
 		return nil, err
 	}
-	err = endpoint.CompleteAuthForm(request.FormID, request.Values)
+	var authResponse adapter.OpenConnectAuthResponse
+	form := request.GetForm()
+	if form != nil {
+		authResponse.Form = &adapter.OpenConnectAuthFormResponse{Values: form.Values}
+	}
+	browser := request.GetBrowser()
+	if browser != nil {
+		authResponse.Browser = &adapter.OpenConnectBrowserResult{
+			FinalURL: browser.FinalURL,
+			Cookies: common.Map(browser.Cookies, func(cookie *OpenConnectBrowserCookie) adapter.OpenConnectBrowserCookie {
+				return adapter.OpenConnectBrowserCookie{Name: cookie.Name, Value: cookie.Value}
+			}),
+			Headers: common.Map(browser.Headers, func(header *OpenConnectBrowserHeader) adapter.OpenConnectBrowserHeader {
+				return adapter.OpenConnectBrowserHeader{Name: header.Name, Values: header.Values}
+			}),
+		}
+	}
+	err = endpoint.CompleteAuthChallenge(request.ChallengeID, authResponse)
 	if err != nil {
 		return nil, err
 	}
 	return &emptypb.Empty{}, nil
 }
 
-func (s *StartedService) CancelOpenConnectAuthForm(ctx context.Context, request *OpenConnectAuthFormCancel) (*emptypb.Empty, error) {
+func (s *StartedService) CancelOpenConnectAuthChallenge(ctx context.Context, request *OpenConnectAuthChallengeCancel) (*emptypb.Empty, error) {
 	err := s.waitForStarted(ctx)
 	if err != nil {
 		return nil, err
@@ -1676,7 +1721,7 @@ func (s *StartedService) CancelOpenConnectAuthForm(ctx context.Context, request 
 	if err != nil {
 		return nil, err
 	}
-	err = endpoint.CancelAuthForm(request.FormID)
+	err = endpoint.CancelAuthChallenge(request.ChallengeID)
 	if err != nil {
 		return nil, err
 	}
@@ -1696,19 +1741,21 @@ func (s *StartedService) SubscribeOpenVPNStatus(
 	s.serviceAccess.RUnlock()
 
 	endpointManager := service.FromContext[adapter.EndpointManager](boxService.ctx)
+	selectedLocale := locale.FromContext(server.Context())
 	return subscribeEndpointStatus(server.Context(), endpointManager, C.TypeOpenVPNClient, "OpenVPN client", func(endpoints []adapter.OpenVPNEndpoint) error {
 		return server.Send(&OpenVPNStatusUpdate{
 			Endpoints: common.Map(endpoints, func(endpoint adapter.OpenVPNEndpoint) *OpenVPNEndpointStatus {
-				return openVPNEndpointStatusToProto(endpoint.Tag(), endpoint.OpenVPNStatus())
+				return openVPNEndpointStatusToProto(endpoint.Tag(), endpoint.OpenVPNStatus(), selectedLocale)
 			}),
 		})
 	})
 }
 
-func openVPNEndpointStatusToProto(tag string, endpointStatus adapter.OpenVPNStatus) *OpenVPNEndpointStatus {
+func openVPNEndpointStatusToProto(tag string, endpointStatus adapter.OpenVPNStatus, selectedLocale *locale.Locale) *OpenVPNEndpointStatus {
 	result := &OpenVPNEndpointStatus{
 		EndpointTag: tag,
 		State:       endpointStatus.State,
+		StateText:   selectedLocale.VPNStateText(endpointStatus.State),
 		Error:       endpointStatus.Error,
 		TunnelInfo:  openVPNTunnelInfoToProto(endpointStatus.TunnelInfo),
 	}

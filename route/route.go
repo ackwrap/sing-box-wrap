@@ -105,12 +105,19 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	if deadline.NeedAdditionalReadDeadline(conn) {
 		conn = deadline.NewConn(conn)
 	}
-	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, conn, nil)
+	selectedOutbound, runtimeRoute, err := r.runtimeOutbound(metadata.Inbound, N.NetworkTCP)
 	if err != nil {
 		return err
 	}
-	var selectedOutbound adapter.Outbound
-	if selectedRule != nil {
+	var selectedRule adapter.Rule
+	var buffers []*buf.Buffer
+	if !runtimeRoute {
+		selectedRule, _, buffers, _, err = r.matchRule(ctx, &metadata, conn, nil)
+		if err != nil {
+			return err
+		}
+	}
+	if !runtimeRoute && selectedRule != nil {
 		switch action := selectedRule.Action().(type) {
 		case *R.RuleActionRoute:
 			var loaded bool
@@ -151,7 +158,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 			return nil
 		}
 	}
-	if selectedRule == nil {
+	if !runtimeRoute && selectedRule == nil {
 		defaultOutbound := r.outbound.Default()
 		if !common.Contains(defaultOutbound.Network(), N.NetworkTCP) {
 			buf.ReleaseMulti(buffers)
@@ -236,13 +243,20 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	if metadata.InboundType == C.TypeTun && metadata.Protocol == C.ProtocolDNS {
 		return r.hijackDNSPacket(ctx, conn, nil, metadata, onClose)
 	}
-	selectedRule, _, _, packetBuffers, err := r.matchRule(ctx, &metadata, nil, conn)
+	selectedOutbound, runtimeRoute, err := r.runtimeOutbound(metadata.Inbound, N.NetworkUDP)
 	if err != nil {
 		return err
 	}
-	var selectedOutbound adapter.Outbound
+	var selectedRule adapter.Rule
+	var packetBuffers []*N.PacketBuffer
+	if !runtimeRoute {
+		selectedRule, _, _, packetBuffers, err = r.matchRule(ctx, &metadata, nil, conn)
+		if err != nil {
+			return err
+		}
+	}
 	var selectReturn bool
-	if selectedRule != nil {
+	if !runtimeRoute && selectedRule != nil {
 		switch action := selectedRule.Action().(type) {
 		case *R.RuleActionRoute:
 			var loaded bool
@@ -279,7 +293,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 			return r.hijackDNSPacket(ctx, conn, packetBuffers, metadata, onClose)
 		}
 	}
-	if selectedRule == nil || selectReturn {
+	if !runtimeRoute && (selectedRule == nil || selectReturn) {
 		defaultOutbound := r.outbound.Default()
 		if !common.Contains(defaultOutbound.Network(), N.NetworkUDP) {
 			N.ReleaseMultiPacketBuffer(packetBuffers)
@@ -303,6 +317,21 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		r.connection.NewPacketConnection(ctx, selectedOutbound, conn, metadata, onClose)
 	}
 	return nil
+}
+
+func (r *Router) runtimeOutbound(inboundTag string, network string) (adapter.Outbound, bool, error) {
+	outboundTag, loaded := r.runtimeInboundOutbound(inboundTag)
+	if !loaded {
+		return nil, false, nil
+	}
+	outbound, loaded := r.outbound.Outbound(outboundTag)
+	if !loaded {
+		return nil, true, E.New("runtime outbound not found: ", outboundTag)
+	}
+	if !common.Contains(outbound.Network(), network) {
+		return nil, true, E.New(network, " is not supported by runtime outbound: ", outboundTag)
+	}
+	return outbound, true, nil
 }
 
 func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) adapter.PreMatchResult {
@@ -391,6 +420,11 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 				return adapter.PreMatchResult{Action: adapter.PreMatchDrop}
 			}
 			return adapter.PreMatchResult{Action: adapter.PreMatchReject}
+		case *R.RuleActionHijackDNS:
+			if metadata.Network != N.NetworkUDP {
+				return continueResult
+			}
+			return adapter.PreMatchResult{Action: adapter.PreMatchHijackDNS}
 		case *R.RuleActionResolve:
 			resolveErr := r.actionResolve(adapter.WithContext(ctx, &metadata), &metadata, action)
 			if resolveErr != nil {
