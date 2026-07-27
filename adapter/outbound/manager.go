@@ -86,9 +86,7 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 			err := adapter.LegacyStart(outbound, stage)
 			done()
 			if err != nil {
-				return E.Append(E.Cause(err, stage, " ", name), common.Close(outbound), func(closeErr error) error {
-					return E.Cause(closeErr, "close failed ", name)
-				})
+				return E.Cause(err, stage, " ", name)
 			}
 		}
 	}
@@ -122,9 +120,7 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
 				monitor.Finish()
 				done()
 				if err != nil {
-					return E.Append(E.Cause(err, "start ", name), common.Close(outboundToStart), func(closeErr error) error {
-						return E.Cause(closeErr, "close failed ", name)
-					})
+					return E.Cause(err, "start ", name)
 				}
 			} else if starter, isStarter := outboundToStart.(interface {
 				Start() error
@@ -135,9 +131,7 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
 				monitor.Finish()
 				done()
 				if err != nil {
-					return E.Append(E.Cause(err, "start ", name), common.Close(outboundToStart), func(closeErr error) error {
-						return E.Cause(closeErr, "close failed ", name)
-					})
+					return E.Cause(err, "start ", name)
 				}
 			}
 		}
@@ -279,9 +273,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 			err = adapter.LegacyStart(outbound, stage)
 			done()
 			if err != nil {
-				return E.Append(E.Cause(err, stage, " ", name), common.Close(outbound), func(closeErr error) error {
-					return E.Cause(closeErr, "close failed ", name)
-				})
+				return E.Cause(err, stage, " ", name)
 			}
 		}
 	}

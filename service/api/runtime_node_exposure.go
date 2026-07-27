@@ -51,15 +51,16 @@ type runtimeAPI struct {
 }
 
 type runtimeNodeExposureRequest struct {
-	Inbound  option.Inbound  `json:"inbound"`
-	Outbound option.Outbound `json:"outbound"`
+	Inbound     option.Inbound `json:"inbound"`
+	OutboundTag string         `json:"outbound_tag"`
 }
 
 type runtimeNodeExposure struct {
-	ID       string
-	Inbound  option.Inbound
-	Outbound option.Outbound
-	Active   bool
+	ID           string
+	Inbound      option.Inbound
+	OutboundTag  string
+	OutboundType string
+	Active       bool
 }
 
 type runtimeNodeExposureSummary struct {
@@ -211,8 +212,9 @@ func (a *runtimeAPI) parseExposure(id string, content []byte) (runtimeNodeExposu
 	if err != nil {
 		return runtimeNodeExposure{}, E.Cause(err, "decode node exposure")
 	}
-	if request.Outbound.Type == "" {
-		return runtimeNodeExposure{}, errors.New("missing outbound type")
+	request.OutboundTag = strings.TrimSpace(request.OutboundTag)
+	if request.OutboundTag == "" {
+		return runtimeNodeExposure{}, errors.New("missing outbound_tag")
 	}
 	switch request.Inbound.Type {
 	case C.TypeHTTP, C.TypeSOCKS, C.TypeMixed:
@@ -238,8 +240,16 @@ func (a *runtimeAPI) parseExposure(id string, content []byte) (runtimeNodeExposu
 		return runtimeNodeExposure{}, errors.New("authentication is required for non-loopback listeners")
 	}
 	request.Inbound.Tag = runtimeNodeExposureTagPrefix + "in-" + id
-	request.Outbound.Tag = runtimeNodeExposureTagPrefix + "out-" + id
-	return runtimeNodeExposure{ID: id, Inbound: request.Inbound, Outbound: request.Outbound}, nil
+	targetOutbound, loaded := a.outboundManager.Outbound(request.OutboundTag)
+	if !loaded {
+		return runtimeNodeExposure{}, E.New("outbound not found: ", request.OutboundTag)
+	}
+	return runtimeNodeExposure{
+		ID:           id,
+		Inbound:      request.Inbound,
+		OutboundTag:  request.OutboundTag,
+		OutboundType: targetOutbound.Type(),
+	}, nil
 }
 
 func runtimeInboundSecurity(options any) (users int, setSystemProxy bool) {
@@ -309,26 +319,17 @@ func (a *runtimeAPI) createLocked(exposure runtimeNodeExposure) error {
 	if _, loaded := a.inboundManager.Get(exposure.Inbound.Tag); loaded {
 		return E.Cause(errRuntimeAPIConflict, "inbound tag ", exposure.Inbound.Tag)
 	}
-	if _, loaded := a.outboundManager.Outbound(exposure.Outbound.Tag); loaded {
-		return E.Cause(errRuntimeAPIConflict, "outbound tag ", exposure.Outbound.Tag)
+	if err := a.validateTarget(exposure); err != nil {
+		return err
 	}
-	if err := a.createOutbound(exposure); err != nil {
-		return E.Cause(err, "create runtime outbound")
-	}
-	a.runtimeRouter.SetRuntimeInboundOutbound(exposure.Inbound.Tag, exposure.Outbound.Tag)
+	a.runtimeRouter.SetRuntimeInboundOutbound(exposure.Inbound.Tag, exposure.OutboundTag)
 	if err := a.createInbound(exposure); err != nil {
-		rollbackErr := a.removeOutboundIfPresent(exposure.Outbound.Tag)
-		if rollbackErr == nil {
-			a.runtimeRouter.RemoveRuntimeInboundOutbound(exposure.Inbound.Tag)
-		} else {
-			exposure.Active = false
-			a.exposures[exposure.ID] = exposure
-		}
-		return runtimeRollbackError(E.Cause(err, "create runtime inbound"), rollbackErr)
+		a.runtimeRouter.RemoveRuntimeInboundOutbound(exposure.Inbound.Tag)
+		return E.Cause(err, "create runtime inbound")
 	}
 	exposure.Active = true
 	a.exposures[exposure.ID] = exposure
-	a.logger.Info("runtime node exposure created: ", exposure.ID, " (", exposure.Inbound.Type, " -> ", exposure.Outbound.Type, ")")
+	a.logger.Info("runtime node exposure created: ", exposure.ID, " (", exposure.Inbound.Type, " -> ", exposure.OutboundType, ")")
 	return nil
 }
 
@@ -336,24 +337,16 @@ func (a *runtimeAPI) updateLocked(existing runtimeNodeExposure, exposure runtime
 	if err := a.inboundManager.Remove(existing.Inbound.Tag); err != nil {
 		return a.restoreLocked(existing, E.Cause(err, "remove previous runtime inbound"))
 	}
-	if err := a.outboundManager.Remove(existing.Outbound.Tag); err != nil {
-		return a.restoreLocked(existing, E.Cause(err, "remove previous runtime outbound"))
+	if err := a.validateTarget(exposure); err != nil {
+		return a.restoreLocked(existing, err)
 	}
-	if err := a.createOutbound(exposure); err != nil {
-		return a.restoreLocked(existing, E.Cause(err, "create replacement runtime outbound"))
-	}
+	a.runtimeRouter.SetRuntimeInboundOutbound(exposure.Inbound.Tag, exposure.OutboundTag)
 	if err := a.createInbound(exposure); err != nil {
-		cleanupErr := a.removeOutboundIfPresent(exposure.Outbound.Tag)
-		if cleanupErr != nil {
-			existing.Active = false
-			a.exposures[existing.ID] = existing
-			return runtimeRollbackError(E.Cause(err, "create replacement runtime inbound"), cleanupErr)
-		}
 		return a.restoreLocked(existing, E.Cause(err, "create replacement runtime inbound"))
 	}
 	exposure.Active = true
 	a.exposures[exposure.ID] = exposure
-	a.logger.Info("runtime node exposure updated: ", exposure.ID, " (", exposure.Inbound.Type, " -> ", exposure.Outbound.Type, ")")
+	a.logger.Info("runtime node exposure updated: ", exposure.ID, " (", exposure.Inbound.Type, " -> ", exposure.OutboundType, ")")
 	return nil
 }
 
@@ -380,9 +373,6 @@ func (a *runtimeAPI) delete(id string) error {
 	if err := a.inboundManager.Remove(existing.Inbound.Tag); err != nil {
 		return a.restoreLocked(existing, E.Cause(err, "remove runtime inbound"))
 	}
-	if err := a.outboundManager.Remove(existing.Outbound.Tag); err != nil {
-		return a.restoreLocked(existing, E.Cause(err, "remove runtime outbound"))
-	}
 	a.runtimeRouter.RemoveRuntimeInboundOutbound(existing.Inbound.Tag)
 	delete(a.exposures, id)
 	a.logger.Info("runtime node exposure deleted: ", id)
@@ -408,21 +398,15 @@ func (a *runtimeAPI) Close() error {
 }
 
 func (a *runtimeAPI) restoreLocked(existing runtimeNodeExposure, operationErr error) error {
-	rollbackErr := a.ensureOutbound(existing)
-	if rollbackErr == nil {
-		a.runtimeRouter.SetRuntimeInboundOutbound(existing.Inbound.Tag, existing.Outbound.Tag)
-		rollbackErr = a.ensureInbound(existing)
-	}
+	a.runtimeRouter.SetRuntimeInboundOutbound(existing.Inbound.Tag, existing.OutboundTag)
+	rollbackErr := a.ensureInbound(existing)
 	existing.Active = rollbackErr == nil
 	a.exposures[existing.ID] = existing
 	return runtimeRollbackError(operationErr, rollbackErr)
 }
 
 func (a *runtimeAPI) cleanupInactiveLocked(exposure runtimeNodeExposure) error {
-	cleanupErr := errors.Join(
-		a.removeInboundIfPresent(exposure.Inbound.Tag),
-		a.removeOutboundIfPresent(exposure.Outbound.Tag),
-	)
+	cleanupErr := a.removeInboundIfPresent(exposure.Inbound.Tag)
 	if cleanupErr == nil {
 		a.runtimeRouter.RemoveRuntimeInboundOutbound(exposure.Inbound.Tag)
 	}
@@ -436,13 +420,6 @@ func (a *runtimeAPI) ensureInbound(exposure runtimeNodeExposure) error {
 	return a.createInbound(exposure)
 }
 
-func (a *runtimeAPI) ensureOutbound(exposure runtimeNodeExposure) error {
-	if _, loaded := a.outboundManager.Outbound(exposure.Outbound.Tag); loaded {
-		return nil
-	}
-	return a.createOutbound(exposure)
-}
-
 func (a *runtimeAPI) removeInboundIfPresent(tag string) error {
 	if _, loaded := a.inboundManager.Get(tag); !loaded {
 		return nil
@@ -450,20 +427,15 @@ func (a *runtimeAPI) removeInboundIfPresent(tag string) error {
 	return a.inboundManager.Remove(tag)
 }
 
-func (a *runtimeAPI) removeOutboundIfPresent(tag string) error {
-	if _, loaded := a.outboundManager.Outbound(tag); !loaded {
-		return nil
-	}
-	return a.outboundManager.Remove(tag)
-}
-
 func (a *runtimeAPI) createInbound(exposure runtimeNodeExposure) error {
 	return a.inboundManager.Create(a.ctx, a.router, a.logger, exposure.Inbound.Tag, exposure.Inbound.Type, exposure.Inbound.Options)
 }
 
-func (a *runtimeAPI) createOutbound(exposure runtimeNodeExposure) error {
-	outboundContext := adapter.WithContext(a.ctx, &adapter.InboundContext{Outbound: exposure.Outbound.Tag})
-	return a.outboundManager.Create(outboundContext, a.router, a.logger, exposure.Outbound.Tag, exposure.Outbound.Type, exposure.Outbound.Options)
+func (a *runtimeAPI) validateTarget(exposure runtimeNodeExposure) error {
+	if _, loaded := a.outboundManager.Outbound(exposure.OutboundTag); !loaded {
+		return E.New("runtime outbound not found: ", exposure.OutboundTag)
+	}
+	return nil
 }
 
 func (e runtimeNodeExposure) summary() runtimeNodeExposureSummary {
@@ -471,8 +443,8 @@ func (e runtimeNodeExposure) summary() runtimeNodeExposureSummary {
 		ID:           e.ID,
 		InboundTag:   e.Inbound.Tag,
 		InboundType:  e.Inbound.Type,
-		OutboundTag:  e.Outbound.Tag,
-		OutboundType: e.Outbound.Type,
+		OutboundTag:  e.OutboundTag,
+		OutboundType: e.OutboundType,
 	}
 }
 
