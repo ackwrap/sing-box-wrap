@@ -50,7 +50,9 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 		err := adapter.LegacyStart(inbound, stage)
 		done()
 		if err != nil {
-			return E.Cause(err, stage, " ", name)
+			return E.Append(E.Cause(err, stage, " ", name), common.Close(inbound), func(closeErr error) error {
+				return E.Cause(closeErr, "close failed ", name)
+			})
 		}
 	}
 	return nil
@@ -133,7 +135,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 			err = adapter.LegacyStart(inbound, stage)
 			done()
 			if err != nil {
-				return E.Cause(err, stage, " ", name)
+				return E.Append(E.Cause(err, stage, " ", name), common.Close(inbound), func(closeErr error) error {
+					return E.Cause(closeErr, "close failed ", name)
+				})
 			}
 		}
 	}

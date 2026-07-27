@@ -30,6 +30,11 @@ type Router interface {
 	ResetNetwork()
 }
 
+type RuntimeRouteManager interface {
+	SetRuntimeInboundOutbound(inboundTag string, outboundTag string)
+	RemoveRuntimeInboundOutbound(inboundTag string)
+}
+
 type PreMatchAction uint8
 
 const (
