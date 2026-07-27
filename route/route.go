@@ -98,14 +98,20 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	case uot.LegacyMagicAddress:
 		return E.New("global UoT (legacy) not supported since sing-box v1.7.0.")
 	}
+	if metadata.InboundType == C.TypeTun && metadata.Protocol == C.ProtocolDNS {
+		N.CloseOnHandshakeFailure(conn, onClose, r.hijackDNSStream(ctx, conn, metadata))
+		return nil
+	}
 	if deadline.NeedAdditionalReadDeadline(conn) {
 		conn = deadline.NewConn(conn)
 	}
 	runtimeSnapshot := r.runtimeRouting.Load()
+	metadataPrepared := false
 	if r.shouldPrepareRuntimeMetadata(metadata.Inbound, runtimeSnapshot) {
 		if err := r.prepareMatchMetadata(ctx, &metadata); err != nil {
 			return err
 		}
+		metadataPrepared = true
 	}
 	selectedOutbound, runtimeRoute, err := r.runtimeLeaseOutboundForSnapshot(metadata, N.NetworkTCP, runtimeSnapshot)
 	if err != nil {
@@ -116,7 +122,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	rulesMatched := false
 	if !runtimeRoute && runtimeRoutingNeedsRuleMetadata(runtimeSnapshot, metadata) {
 		rulesMatched = true
-		selectedRule, _, buffers, _, err = r.matchRule(ctx, &metadata, conn, nil)
+		selectedRule, _, buffers, _, err = r.matchPreparedRule(ctx, &metadata, conn, nil)
 		if err != nil {
 			return err
 		}
@@ -138,15 +144,12 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	if runtimeRoute {
 		selectedRule = nil
 	}
-	if !runtimeRoute && metadata.InboundType == C.TypeTun && metadata.Protocol == C.ProtocolDNS {
-		for _, buffer := range buffers {
-			conn = bufio.NewCachedConn(conn, buffer)
-		}
-		N.CloseOnHandshakeFailure(conn, onClose, r.hijackDNSStream(ctx, conn, metadata))
-		return nil
-	}
 	if !runtimeRoute && !rulesMatched {
-		selectedRule, _, buffers, _, err = r.matchRule(ctx, &metadata, conn, nil)
+		if metadataPrepared {
+			selectedRule, _, buffers, _, err = r.matchPreparedRule(ctx, &metadata, conn, nil)
+		} else {
+			selectedRule, _, buffers, _, err = r.matchRule(ctx, &metadata, conn, nil)
+		}
 		if err != nil {
 			return err
 		}
@@ -154,7 +157,6 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	if !runtimeRoute && selectedRule != nil {
 		switch action := selectedRule.Action().(type) {
 		case *R.RuleActionRoute:
-			applyRouteActionOptions(&metadata, &action.RuleActionRouteOptions)
 			var loaded bool
 			selectedOutbound, loaded = r.outbound.Outbound(action.Outbound)
 			if !loaded {
@@ -169,7 +171,6 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 			if action.Outbound == "" {
 				break
 			}
-			applyRouteActionOptions(&metadata, &action.RuleActionRouteOptions)
 			var loaded bool
 			selectedOutbound, loaded = r.outbound.Outbound(action.Outbound)
 			if !loaded {
@@ -276,11 +277,16 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	/*if deadline.NeedAdditionalReadDeadline(conn) {
 		conn = deadline.NewPacketConn(bufio.NewNetPacketConn(conn))
 	}*/
+	if metadata.InboundType == C.TypeTun && metadata.Protocol == C.ProtocolDNS {
+		return r.hijackDNSPacket(ctx, conn, nil, metadata, onClose)
+	}
 	runtimeSnapshot := r.runtimeRouting.Load()
+	metadataPrepared := false
 	if r.shouldPrepareRuntimeMetadata(metadata.Inbound, runtimeSnapshot) {
 		if err := r.prepareMatchMetadata(ctx, &metadata); err != nil {
 			return err
 		}
+		metadataPrepared = true
 	}
 	selectedOutbound, runtimeRoute, err := r.runtimeLeaseOutboundForSnapshot(metadata, N.NetworkUDP, runtimeSnapshot)
 	if err != nil {
@@ -291,7 +297,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	rulesMatched := false
 	if !runtimeRoute && runtimeRoutingNeedsRuleMetadata(runtimeSnapshot, metadata) {
 		rulesMatched = true
-		selectedRule, _, _, packetBuffers, err = r.matchRule(ctx, &metadata, nil, conn)
+		selectedRule, _, _, packetBuffers, err = r.matchPreparedRule(ctx, &metadata, nil, conn)
 		if err != nil {
 			return err
 		}
@@ -313,11 +319,12 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	if runtimeRoute {
 		selectedRule = nil
 	}
-	if !runtimeRoute && metadata.InboundType == C.TypeTun && metadata.Protocol == C.ProtocolDNS {
-		return r.hijackDNSPacket(ctx, conn, packetBuffers, metadata, onClose)
-	}
 	if !runtimeRoute && !rulesMatched {
-		selectedRule, _, _, packetBuffers, err = r.matchRule(ctx, &metadata, nil, conn)
+		if metadataPrepared {
+			selectedRule, _, _, packetBuffers, err = r.matchPreparedRule(ctx, &metadata, nil, conn)
+		} else {
+			selectedRule, _, _, packetBuffers, err = r.matchRule(ctx, &metadata, nil, conn)
+		}
 		if err != nil {
 			return err
 		}
@@ -326,7 +333,6 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	if !runtimeRoute && selectedRule != nil {
 		switch action := selectedRule.Action().(type) {
 		case *R.RuleActionRoute:
-			applyRouteActionOptions(&metadata, &action.RuleActionRouteOptions)
 			var loaded bool
 			selectedOutbound, loaded = r.outbound.Outbound(action.Outbound)
 			if !loaded {
@@ -341,7 +347,6 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 			if action.Outbound == "" {
 				break
 			}
-			applyRouteActionOptions(&metadata, &action.RuleActionRouteOptions)
 			var loaded bool
 			selectedOutbound, loaded = r.outbound.Outbound(action.Outbound)
 			if !loaded {
@@ -725,6 +730,20 @@ func (r *Router) matchRule(
 	selectedRule adapter.Rule, selectedRuleIndex int,
 	buffers []*buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error,
 ) {
+	fatalErr = r.prepareMatchMetadata(ctx, metadata)
+	if fatalErr != nil {
+		return
+	}
+	return r.matchPreparedRule(ctx, metadata, inputConn, inputPacketConn)
+}
+
+func (r *Router) matchPreparedRule(
+	ctx context.Context, metadata *adapter.InboundContext,
+	inputConn net.Conn, inputPacketConn N.PacketConn,
+) (
+	selectedRule adapter.Rule, selectedRuleIndex int,
+	buffers []*buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error,
+) {
 match:
 	for currentRuleIndex, currentRule := range r.rules {
 		metadata.ResetRuleCache()
@@ -737,7 +756,18 @@ match:
 		} else {
 			r.logger.DebugContext(ctx, "match[", currentRuleIndex, "] => ", currentRule.Action())
 		}
-		if routeOptions, isRouteOptions := currentRule.Action().(*R.RuleActionRouteOptions); isRouteOptions {
+		var routeOptions *R.RuleActionRouteOptions
+		switch action := currentRule.Action().(type) {
+		case *R.RuleActionRoute:
+			routeOptions = &action.RuleActionRouteOptions
+		case *R.RuleActionRouteOptions:
+			routeOptions = action
+		case *R.RuleActionBypass:
+			if action.Outbound != "" {
+				routeOptions = &action.RuleActionRouteOptions
+			}
+		}
+		if routeOptions != nil {
 			applyRouteActionOptions(metadata, routeOptions)
 		}
 		switch action := currentRule.Action().(type) {

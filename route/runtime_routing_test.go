@@ -306,7 +306,7 @@ func TestRuntimeRoutingUsesSniffedDomainBeforeLowerPriorityRoute(t *testing.T) {
 	go func() {
 		_, _ = client.Write([]byte("GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n"))
 	}()
-	selectedRule, _, buffers, _, err := router.matchRule(router.ctx, &metadata, server, nil)
+	selectedRule, _, buffers, _, err := router.matchPreparedRule(router.ctx, &metadata, server, nil)
 	defer buf.ReleaseMulti(buffers)
 	if err != nil {
 		t.Fatal(err)
