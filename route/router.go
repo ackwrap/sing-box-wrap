@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -50,6 +51,8 @@ type Router struct {
 	platformInterface  adapter.PlatformInterface
 	runtimeRouteAccess sync.RWMutex
 	runtimeOutbounds   map[string]string
+	runtimeRouting     atomic.Pointer[compiledRuntimeRouting]
+	runtimeEvents      runtimeAccessEventRing
 	started            bool
 }
 

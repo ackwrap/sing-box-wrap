@@ -287,7 +287,10 @@ func (m *fakeOutboundManager) Create(_ context.Context, _ adapter.Router, _ log.
 }
 
 type fakeRuntimeRouteManager struct {
-	items map[string]string
+	items   map[string]string
+	config  adapter.RuntimeRoutingConfig
+	events  adapter.RuntimeAccessEventList
+	replace func(adapter.RuntimeRoutingConfig) error
 }
 
 func (m *fakeRuntimeRouteManager) SetRuntimeInboundOutbound(inboundTag string, outboundTag string) {
@@ -296,4 +299,22 @@ func (m *fakeRuntimeRouteManager) SetRuntimeInboundOutbound(inboundTag string, o
 
 func (m *fakeRuntimeRouteManager) RemoveRuntimeInboundOutbound(inboundTag string) {
 	delete(m.items, inboundTag)
+}
+
+func (m *fakeRuntimeRouteManager) ReplaceRuntimeRouting(config adapter.RuntimeRoutingConfig) error {
+	if m.replace != nil {
+		if err := m.replace(config); err != nil {
+			return err
+		}
+	}
+	m.config = config
+	return nil
+}
+
+func (m *fakeRuntimeRouteManager) RuntimeRoutingSnapshot() adapter.RuntimeRoutingConfig {
+	return m.config
+}
+
+func (m *fakeRuntimeRouteManager) RuntimeAccessEvents(uint64, int) adapter.RuntimeAccessEventList {
+	return m.events
 }

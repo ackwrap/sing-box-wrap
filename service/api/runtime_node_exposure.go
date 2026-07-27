@@ -117,6 +117,14 @@ func (a *runtimeAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request
 		writeRuntimeAPIJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
+	if request.URL.Path == runtimeRoutingPath {
+		a.handleRuntimeRouting(writer, request)
+		return
+	}
+	if request.URL.Path == runtimeAccessEventsPath {
+		a.handleRuntimeAccessEvents(writer, request)
+		return
+	}
 	if request.URL.Path == runtimeNodeExposurePath {
 		if request.Method != http.MethodGet {
 			writeRuntimeAPIError(writer, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
