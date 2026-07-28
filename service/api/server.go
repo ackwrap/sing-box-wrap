@@ -121,20 +121,20 @@ func (s *Service) Start(stage adapter.StartStage) error {
 }
 
 func (s *Service) Close() error {
-	var err error
-	if s.httpServer != nil {
-		err = E.Append(err, s.httpServer.Close(), func(err error) error {
-			return E.Cause(err, "close HTTP server")
-		})
-	}
-	if s.runtimeAPI != nil {
-		err = E.Append(err, s.runtimeAPI.Close(), func(err error) error {
-			return E.Cause(err, "close runtime API")
-		})
-	}
 	s.cancel()
 	if s.dashboard != nil {
 		s.dashboard.close()
+	}
+	var err error
+	if s.httpServer != nil {
+		err = E.Append(err, s.httpServer.Close(), func(closeErr error) error {
+			return E.Cause(closeErr, "close HTTP server")
+		})
+	}
+	if s.runtimeAPI != nil {
+		err = E.Append(err, s.runtimeAPI.Close(), func(closeErr error) error {
+			return E.Cause(closeErr, "close runtime API")
+		})
 	}
 	if s.grpcServer != nil {
 		s.grpcServer.Stop()

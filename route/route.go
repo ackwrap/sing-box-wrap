@@ -722,7 +722,6 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 	}
 	return nil
 }
-
 func (r *Router) matchRule(
 	ctx context.Context, metadata *adapter.InboundContext,
 	inputConn net.Conn, inputPacketConn N.PacketConn,
