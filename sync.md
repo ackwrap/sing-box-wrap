@@ -57,3 +57,40 @@
 - `go vet ./...` 仅报告既有 `unsafe.Pointer` 告警：`daemon/managed_service.go`、`experimental/libbox/debug.go`、`experimental/boxdd/authenticode_windows.go`。
 - Android/Apple 子模块工作树已分别对齐合并后的 gitlink。
 - `git diff --cached --check` 通过；不存在冲突标记或未解决索引。
+
+## 2026-07-28
+
+- 合并目标：`origin/sync` (`455d3798d5d8f48f9ff5e44d834226eda814b7d7`) -> `devel` (`2182e6378a96ebc19b77298ba55b40207de5b29f`)。
+- merge base：`c9e81856e572b332dffb8ba0a6a4ba3bee1f95d2`。
+- 背景：`sync` 再次重写历史，上次已合并的 `69615725` 不再是新 `sync` 的祖先，因此 TLS、router、API 等相同定制冲突再次出现。后续应评估用可重放的 Ackwrap patch/commit 队列替代长期双向历史合并。
+
+### 冲突决策
+
+| 文件 | 决策与理由 |
+| --- | --- |
+| `adapter/router.go` | 采用 `sync` 新版 Router/PreMatch 接口，恢复 Ackwrap runtime routing 接口和数据结构。 |
+| `common/httpclient/apple_transport_darwin.go` | 采用 `sync` Apple HTTP 实现，保留对不支持完整证书 SHA-256 pin 的明确拒绝，避免静默忽略。 |
+| `common/tls/apple_client_platform.go` | 采用 `sync` 平台实现，恢复完整证书 SHA-256 校验和失败清理。 |
+| `common/tls/reality_client.go` | 采用 `sync` Reality 实现，保留对不支持完整证书 pin 的明确错误。 |
+| `common/tls/std_client.go` | 采用 `sync` 标准 TLS 实现，保留完整证书 pin 及空证书保护。 |
+| `common/tls/system_client.go` | 采用 `sync` 系统 TLS 校验流程，恢复完整证书 pin 的解析、冲突检查和返回状态。 |
+| `common/tls/system_client_engine.go` | 采用 `sync` 引擎结构，恢复完整证书 pin 在 clone 和构造链路中的传播。 |
+| `common/tls/windows_client.go` | 采用 `sync` Schannel 实现，恢复握手后的完整证书 SHA-256 校验。 |
+| `include/registry.go` | 采用 `sync` 最新注册表，恢复 Ackwrap ShadowsocksR outbound 注册。 |
+| `route/route.go` | 手工融合：保留 runtime lease、动态路由、节点暴露和访问事件；采用 `sync` 新版连接处理和 route option 行为，并继续通过 `matchPreparedRule` 避免重复元数据解析。 |
+| `route/router.go` | 采用 `sync` 最新生命周期和字段，恢复 runtime outbound 映射、动态路由快照与访问事件状态。 |
+| `service/api/server.go` | 采用 `sync` 最新服务启动/关闭顺序，恢复 runtime API 创建、挂载和关闭错误聚合。 |
+| `service/api/web_bridge.go` | 采用 `sync` 最新 gRPC-Web/WebSocket bridge，恢复 runtime API 路由及 PUT/DELETE CORS。 |
+| `service/oomkiller/service_darwin.go` | 采用 `sync` 最新 OOM 实现，但保留 `CompareAndSwap` 防止并发重复生成 draft。 |
+| `go.mod` | 采用 `sync` 新版 `sing-tun`，保留 Ackwrap `sing-vmess` replace。 |
+| `go.sum` | 采用新版 `sing-tun` 校验和，保留 Ackwrap `sing-vmess` 校验和。 |
+| `docs/configuration/shared/pre-match.md` | 文档冲突按规则采用 `sync`。 |
+| `docs/configuration/shared/pre-match.zh.md` | 文档冲突按规则采用 `sync`。 |
+
+### 验证结果
+
+- `go test ./route ./service/api ./common/tls ./common/httpclient ./service/oomkiller ./protocol/shadowsocksr ./transport/clashssr/... ./experimental/clashapi ./protocol/vless` 通过。
+- `go mod tidy` 完成，保留 Ackwrap `sing-vmess` replace，并采用 `sync` 最新 `sing-tun`。
+- `make build` 通过；`go build ./...` 在 Windows 临时文件锁释放后单独重跑通过。
+- `go test ./...` 除既有环境依赖外均通过：`common/tlsfragment` 依赖外部 TLS 网络，`common/tlsspoof` 和 `common/windivert` 需要管理员权限。
+- `go vet ./...` 仅报告既有 `unsafe.Pointer` 告警：`daemon/managed_service.go`、`experimental/libbox/debug.go`、`experimental/boxdd/authenticode_windows.go`。

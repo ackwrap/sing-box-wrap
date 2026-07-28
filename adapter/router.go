@@ -95,7 +95,6 @@ type RuntimeAccessEventList struct {
 	Items    []RuntimeAccessEvent `json:"items"`
 	LatestID uint64               `json:"latest_id"`
 }
-
 type PreMatchAction uint8
 
 const (
