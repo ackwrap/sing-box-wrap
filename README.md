@@ -18,7 +18,7 @@ Build the prepared core:
 ```bash
 cd .work/sing-box
 make build
-go build ./...
+go build ./cmd/sing-box
 ```
 
 Do not edit the official submodule directly. Update its gitlink and

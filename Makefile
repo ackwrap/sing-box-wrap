@@ -11,4 +11,4 @@ build: prepare
 
 verify: prepare
 	cd "$(CORE_DIR)" && go mod tidy && git diff --exit-code -- go.mod go.sum
-	cd "$(CORE_DIR)" && go build ./...
+	cd "$(CORE_DIR)" && go build ./cmd/sing-box

@@ -31,7 +31,7 @@
 - Patch preparation must succeed from a clean clone with initialized
   submodules.
 - `go mod tidy` in the prepared worktree must produce no diff.
-- Run `make build` and `go build ./...` in the prepared worktree.
+- Run `make build` and `go build ./cmd/sing-box` in the prepared worktree.
 - Run focused tests when test patches are introduced later.
 - Do not modify, remove, or weaken upstream tests to make verification pass.
 
