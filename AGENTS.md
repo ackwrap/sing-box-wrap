@@ -1,42 +1,44 @@
 # Repository-specific agent notes
 
-## Repository boundaries
+## Repository boundary
 
-- The root module is `github.com/sagernet/sing-box` (Go `1.24.7`); the CLI entry point is `./cmd/sing-box`.
-- Preserve `go.mod`'s replacement of `github.com/sagernet/sing-vmess` with `github.com/ackwrap/sing-vmess`; it is a fork-specific change, not dependency drift.
-- Do not modify `go.sum` unless the requested change actually requires dependency resolution. Reuse existing functions and framework components instead of duplicating equivalent logic.
-- `test/` is a separate Go module that replaces `github.com/sagernet/sing-box` with `../`. Root `go test ./...` does not include it.
-- `clients/android/` and `clients/apple/` are embedded client projects. However, many root `Makefile` release targets still operate on sibling checkouts `../sing-box-for-android` and `../sing-box-for-apple`; use the client-local Gradle wrapper or Apple `Makefile` for these embedded trees.
+- This repository is a wrapper, not a sing-box source fork.
+- `sing-box/` is the unmodified official SagerNet/sing-box submodule.
+- Ackwrap production changes are the ordered patches listed in `patches/series`.
+- The pinned official commit is recorded both by the gitlink and in
+  `patches/upstream.txt`; they must always match.
+- Do not edit files inside `sing-box/` directly.
+- The initial patch stack excludes Ackwrap-specific test files. Do not add test
+  patches until the production stack migration is complete and explicitly
+  approved.
 
-## Protocol development
+## Development flow
 
-- Add new protocols in a dedicated directory where practical. Reuse the existing protocol framework and follow comparable in-tree implementations rather than creating a parallel architecture.
-- Prefer implementing protocol behavior in this repository based on the established framework instead of directly importing another protocol implementation. Confirm with the user before adding such an external implementation or dependency.
+- `main` is protected. Make changes on a non-main feature branch.
+- Run `python scripts/prepare_core.py` to create `.work/sing-box` with all
+  patches applied.
+- Develop in a disposable patched worktree, then export the production diff to
+  the appropriate logical patch. Never commit generated `.work/` content.
+- Keep patches separated by feature and ordered by `patches/series`; do not
+  replace the stack with one aggregate diff.
+- An upstream update changes only the `sing-box` gitlink,
+  `patches/upstream.txt`, and patches that genuinely need rebasing.
+- Upstream updates must be proposed on a feature branch and reviewed; do not
+  force-update protected branches.
 
-## Branch flow
+## Verification
 
-- `sync` mirrors the official upstream branch, `devel` is the development branch, and `main` is the primary branch. Normal promotion order is `sync` -> `devel` -> `main`; do not bypass it unless explicitly requested.
-- `devel` is the merge boundary between upstream synchronization and Ackwrap development. Before pull, merge, rebase, checkout, or a parent-repository submodule update, run `git status --short` here and stop if the worktree is dirty.
-- Never run reset, clean, `git submodule update --force`, or another command that moves this worktree while uncommitted protocol files exist. Such an update previously moved the worktree from the parent-recorded commit to `origin/devel` and removed an uncommitted SSR implementation.
-- For core features, verify, commit, and push this repository first. Only then update and commit the parent repository's submodule pointer.
-- After any branch synchronization, verify `git rev-parse HEAD`, `git status --short`, and the expected feature paths before continuing.
+- Patch preparation must succeed from a clean clone with initialized
+  submodules.
+- `go mod tidy` in the prepared worktree must produce no diff.
+- Run `make build` and `go build ./...` in the prepared worktree.
+- Run focused tests when test patches are introduced later.
+- Do not modify, remove, or weaken upstream tests to make verification pass.
 
-## Go verification
+## Operational safety
 
-- `make build` and `make race` set `GOTOOLCHAIN=local` and build `./cmd/sing-box` with tags from `release/DEFAULT_BUILD_TAGS_OTHERS` unless `TAGS` is overridden.
-- Focus a root test with `go test ./path/to/package -run '^TestName$'`. For CI parity, also pass tags from `release/DEFAULT_BUILD_TAGS_OTHERS` and ldflags from `release/LDFLAGS`; Unix CI additionally runs tests through `sudo` via `-exec sudo`.
-- Focus an integration test from `test/` with `go test -run '^TestName$' .` (plus any required `-tags`). These tests create Docker containers with host networking, so they require a reachable Docker daemon and may bind fixed host ports.
-- `make test` first tests the root module, then enters `test/`, runs `go mod tidy`, and runs its suite. It can modify `test/go.mod` or `test/go.sum`; `make test_stdio` adds `force_stdio` to the integration tags.
-- `make lint` runs golangci-lint for Linux, Android, Windows, and Darwin. `.golangci.yml` supplies the repository build tags and uses `gci` plus `gofumpt`; `make fmt` can rewrite files.
-
-## Generated and mobile code
-
-- Do not hand-edit `*.pb.go`. `make proto` regenerates every repository `.proto`, normalizes generated headers, and formats the repository; it requires `protoc`, `protoc-gen-go`, `protoc-gen-go-grpc`, and `gofumpt`.
-- `make lib_android` requires the repository gomobile tools (`make lib_install`), OpenJDK 17, an Android SDK, and NDK `28.0.13004108` (another installed NDK is accepted with a reproducibility warning). It emits `libbox.aar` and `libbox-legacy.aar` at the repository root; copy them to `clients/android/app/libs/` before Gradle builds.
-- Run Android commands from `clients/android/` with `./gradlew`; formatting is `./gradlew spotlessApply`, checking includes `./gradlew spotlessCheck detekt`, and app variants are `other`, `otherLegacy`, and `play`.
-- `make lib_apple` requires gomobile and the Apple/Xcode toolchain. It creates `Libbox.xcframework` at the repository root, but moves it to `../sing-box-for-apple` when that sibling exists; place the framework in `clients/apple/` before building the embedded client. The Apple client uses `make fmt` (`swiftformat`) and `make lint` (`swiftlint`) from that directory.
-
-## Dangerous commands
-
-- Never run root `make update`: it fetches, hard-resets to `FETCH_HEAD`, and runs `git clean -fdx`.
-- Treat release, upload, publish, notarize, and version-update targets as operational commands; several use credentials, mutate versions/tags, or publish artifacts.
+- Do not commit or push generated core source or build artifacts.
+- Do not publish releases, update tags, or change release credentials without
+  explicit approval.
+- Do not delete legacy branches until this wrapper structure has been merged,
+  cloned from scratch, and independently verified.

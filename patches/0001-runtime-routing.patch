@@ -1,0 +1,2008 @@
+diff --git a/adapter/inbound/manager.go b/adapter/inbound/manager.go
+index d6567cdefcd658400a4a0ead552483307c079b05..27c8f5f3f030f3eb854dbfc9b492204f7bc252de 100644
+--- a/adapter/inbound/manager.go
++++ b/adapter/inbound/manager.go
+@@ -98,11 +98,16 @@ func (m *Manager) Get(tag string) (adapter.Inbound, bool) {
+ 
+ func (m *Manager) Remove(tag string) error {
+ 	m.access.Lock()
++	defer m.access.Unlock()
+ 	inbound, found := m.inboundByTag[tag]
+ 	if !found {
+-		m.access.Unlock()
+ 		return os.ErrInvalid
+ 	}
++	if m.started {
++		if err := inbound.Close(); err != nil {
++			return err
++		}
++	}
+ 	delete(m.inboundByTag, tag)
+ 	index := common.Index(m.inbounds, func(it adapter.Inbound) bool {
+ 		return it == inbound
+@@ -111,11 +116,6 @@ func (m *Manager) Remove(tag string) error {
+ 		panic("invalid inbound index")
+ 	}
+ 	m.inbounds = append(m.inbounds[:index], m.inbounds[index+1:]...)
+-	started := m.started
+-	m.access.Unlock()
+-	if started {
+-		return inbound.Close()
+-	}
+ 	return nil
+ }
+ 
+@@ -133,7 +133,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
+ 			err = adapter.LegacyStart(inbound, stage)
+ 			done()
+ 			if err != nil {
+-				return E.Cause(err, stage, " ", name)
++				return E.Append(E.Cause(err, stage, " ", name), common.Close(inbound), func(closeErr error) error {
++					return E.Cause(closeErr, "close failed ", name)
++				})
+ 			}
+ 		}
+ 	}
+diff --git a/adapter/router.go b/adapter/router.go
+index 1de092b1ebf6b45b4167cbc9e2153c95c2520181..e63e48b0ddc89bcc8bce28a5daa21a8a2e9dde10 100644
+--- a/adapter/router.go
++++ b/adapter/router.go
+@@ -30,6 +30,71 @@ type Router interface {
+ 	ResetNetwork()
+ }
+ 
++type RuntimeRouteManager interface {
++	SetRuntimeInboundOutbound(inboundTag string, outboundTag string)
++	RemoveRuntimeInboundOutbound(inboundTag string)
++	ReplaceRuntimeRouting(config RuntimeRoutingConfig) error
++	RuntimeRoutingSnapshot() RuntimeRoutingConfig
++	RuntimeAccessEvents(after uint64, limit int) RuntimeAccessEventList
++}
++
++type RuntimeRoutingConfig struct {
++	Routes                  []RuntimeRoute `json:"routes"`
++	Leases                  []RuntimeLease `json:"leases"`
++	UnhealthyOutbounds      []string       `json:"unhealthy_outbounds"`
++	AccessEventsEnabled     bool           `json:"access_events_enabled"`
++	AccessEventsPrivacyMode string         `json:"access_events_privacy_mode"`
++}
++
++const (
++	RuntimeAccessPrivacyStrict   = "strict"
++	RuntimeAccessPrivacyBalanced = "balanced"
++)
++
++type RuntimeRoute struct {
++	ID                  string   `json:"id"`
++	Priority            int      `json:"priority"`
++	Platform            string   `json:"platform"`
++	InboundTags         []string `json:"inbound_tags"`
++	SourcePrefixes      []string `json:"source_prefixes"`
++	Domains             []string `json:"domains"`
++	DomainSuffixes      []string `json:"domain_suffixes"`
++	DomainKeywords      []string `json:"domain_keywords"`
++	DestinationPrefixes []string `json:"destination_prefixes"`
++	OutboundTag         string   `json:"outbound_tag"`
++	FallbackOutboundTag string   `json:"fallback_outbound_tag"`
++}
++
++type RuntimeLease struct {
++	ID                  string   `json:"id"`
++	SourcePrefix        string   `json:"source_prefix"`
++	InboundTags         []string `json:"inbound_tags"`
++	Platform            string   `json:"platform"`
++	OutboundTag         string   `json:"outbound_tag"`
++	FallbackOutboundTag string   `json:"fallback_outbound_tag"`
++	ExpiresAt           int64    `json:"expires_at"`
++}
++
++type RuntimeAccessEvent struct {
++	ID            uint64 `json:"id"`
++	Time          int64  `json:"time"`
++	Network       string `json:"network"`
++	Inbound       string `json:"inbound"`
++	SourceIP      string `json:"source_ip"`
++	DestinationIP string `json:"destination_ip"`
++	Domain        string `json:"domain"`
++	OutboundTag   string `json:"outbound_tag"`
++	Platform      string `json:"platform"`
++	RouteID       string `json:"route_id"`
++	LeaseID       string `json:"lease_id"`
++	Decision      string `json:"decision"`
++	Error         string `json:"error"`
++}
++
++type RuntimeAccessEventList struct {
++	Items    []RuntimeAccessEvent `json:"items"`
++	LatestID uint64               `json:"latest_id"`
++}
+ type PreMatchAction uint8
+ 
+ const (
+diff --git a/route/route.go b/route/route.go
+index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab9dee7573 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -105,12 +105,56 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+ 	if deadline.NeedAdditionalReadDeadline(conn) {
+ 		conn = deadline.NewConn(conn)
+ 	}
+-	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, conn, nil)
++	runtimeSnapshot := r.runtimeRouting.Load()
++	metadataPrepared := false
++	if r.shouldPrepareRuntimeMetadata(metadata.Inbound, runtimeSnapshot) {
++		if err := r.prepareMatchMetadata(ctx, &metadata); err != nil {
++			return err
++		}
++		metadataPrepared = true
++	}
++	selectedOutbound, runtimeRoute, err := r.runtimeLeaseOutboundForSnapshot(metadata, N.NetworkTCP, runtimeSnapshot)
+ 	if err != nil {
+ 		return err
+ 	}
+-	var selectedOutbound adapter.Outbound
+-	if selectedRule != nil {
++	var selectedRule adapter.Rule
++	var buffers []*buf.Buffer
++	rulesMatched := false
++	if !runtimeRoute && runtimeRoutingNeedsRuleMetadata(runtimeSnapshot, metadata) {
++		rulesMatched = true
++		selectedRule, _, buffers, _, err = r.matchPreparedRule(ctx, &metadata, conn, nil)
++		if err != nil {
++			return err
++		}
++	}
++	if !runtimeRoute {
++		selectedOutbound, runtimeRoute, err = r.runtimeRouteOutboundForSnapshot(metadata, N.NetworkTCP, runtimeSnapshot)
++		if err != nil {
++			buf.ReleaseMulti(buffers)
++			return err
++		}
++	}
++	if !runtimeRoute {
++		selectedOutbound, runtimeRoute, err = r.runtimeNodeExposureOutboundForSnapshot(metadata, N.NetworkTCP, runtimeSnapshot)
++		if err != nil {
++			buf.ReleaseMulti(buffers)
++			return err
++		}
++	}
++	if runtimeRoute {
++		selectedRule = nil
++	}
++	if !runtimeRoute && !rulesMatched {
++		if metadataPrepared {
++			selectedRule, _, buffers, _, err = r.matchPreparedRule(ctx, &metadata, conn, nil)
++		} else {
++			selectedRule, _, buffers, _, err = r.matchRule(ctx, &metadata, conn, nil)
++		}
++		if err != nil {
++			return err
++		}
++	}
++	if !runtimeRoute && selectedRule != nil {
+ 		switch action := selectedRule.Action().(type) {
+ 		case *R.RuleActionRoute:
+ 			var loaded bool
+@@ -151,7 +195,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+ 			return nil
+ 		}
+ 	}
+-	if selectedRule == nil {
++	if !runtimeRoute && selectedRule == nil {
+ 		defaultOutbound := r.outbound.Default()
+ 		if !common.Contains(defaultOutbound.Network(), N.NetworkTCP) {
+ 			buf.ReleaseMulti(buffers)
+@@ -236,13 +280,57 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+ 	if metadata.InboundType == C.TypeTun && metadata.Protocol == C.ProtocolDNS {
+ 		return r.hijackDNSPacket(ctx, conn, nil, metadata, onClose)
+ 	}
+-	selectedRule, _, _, packetBuffers, err := r.matchRule(ctx, &metadata, nil, conn)
++	runtimeSnapshot := r.runtimeRouting.Load()
++	metadataPrepared := false
++	if r.shouldPrepareRuntimeMetadata(metadata.Inbound, runtimeSnapshot) {
++		if err := r.prepareMatchMetadata(ctx, &metadata); err != nil {
++			return err
++		}
++		metadataPrepared = true
++	}
++	selectedOutbound, runtimeRoute, err := r.runtimeLeaseOutboundForSnapshot(metadata, N.NetworkUDP, runtimeSnapshot)
+ 	if err != nil {
+ 		return err
+ 	}
+-	var selectedOutbound adapter.Outbound
++	var selectedRule adapter.Rule
++	var packetBuffers []*N.PacketBuffer
++	rulesMatched := false
++	if !runtimeRoute && runtimeRoutingNeedsRuleMetadata(runtimeSnapshot, metadata) {
++		rulesMatched = true
++		selectedRule, _, _, packetBuffers, err = r.matchPreparedRule(ctx, &metadata, nil, conn)
++		if err != nil {
++			return err
++		}
++	}
++	if !runtimeRoute {
++		selectedOutbound, runtimeRoute, err = r.runtimeRouteOutboundForSnapshot(metadata, N.NetworkUDP, runtimeSnapshot)
++		if err != nil {
++			N.ReleaseMultiPacketBuffer(packetBuffers)
++			return err
++		}
++	}
++	if !runtimeRoute {
++		selectedOutbound, runtimeRoute, err = r.runtimeNodeExposureOutboundForSnapshot(metadata, N.NetworkUDP, runtimeSnapshot)
++		if err != nil {
++			N.ReleaseMultiPacketBuffer(packetBuffers)
++			return err
++		}
++	}
++	if runtimeRoute {
++		selectedRule = nil
++	}
++	if !runtimeRoute && !rulesMatched {
++		if metadataPrepared {
++			selectedRule, _, _, packetBuffers, err = r.matchPreparedRule(ctx, &metadata, nil, conn)
++		} else {
++			selectedRule, _, _, packetBuffers, err = r.matchRule(ctx, &metadata, nil, conn)
++		}
++		if err != nil {
++			return err
++		}
++	}
+ 	var selectReturn bool
+-	if selectedRule != nil {
++	if !runtimeRoute && selectedRule != nil {
+ 		switch action := selectedRule.Action().(type) {
+ 		case *R.RuleActionRoute:
+ 			var loaded bool
+@@ -279,7 +367,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+ 			return r.hijackDNSPacket(ctx, conn, packetBuffers, metadata, onClose)
+ 		}
+ 	}
+-	if selectedRule == nil || selectReturn {
++	if !runtimeRoute && (selectedRule == nil || selectReturn) {
+ 		defaultOutbound := r.outbound.Default()
+ 		if !common.Contains(defaultOutbound.Network(), N.NetworkUDP) {
+ 			N.ReleaseMultiPacketBuffer(packetBuffers)
+@@ -305,10 +393,74 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+ 	return nil
+ }
+ 
++func (r *Router) runtimeOutbound(inboundTag string, network string) (adapter.Outbound, bool, error) {
++	outboundTag, loaded := r.runtimeInboundOutbound(inboundTag)
++	if !loaded {
++		return nil, false, nil
++	}
++	outbound, loaded := r.outbound.Outbound(outboundTag)
++	if !loaded {
++		return nil, true, E.New("runtime outbound not found: ", outboundTag)
++	}
++	if !common.Contains(outbound.Network(), network) {
++		return nil, true, E.New(network, " is not supported by runtime outbound: ", outboundTag)
++	}
++	return outbound, true, nil
++}
++
++func (r *Router) runtimeSelectedOutbound(metadata adapter.InboundContext, network string) (adapter.Outbound, bool, error) {
++	return r.runtimeSelectedOutboundForSnapshot(metadata, network, r.runtimeRouting.Load())
++}
++
++func (r *Router) runtimeSelectedOutboundForSnapshot(metadata adapter.InboundContext, network string, snapshot *compiledRuntimeRouting) (adapter.Outbound, bool, error) {
++	outbound, selected, err := r.runtimeRoutingOutboundForSnapshot(metadata, network, snapshot)
++	if selected {
++		return outbound, true, err
++	}
++	return r.runtimeNodeExposureOutboundForSnapshot(metadata, network, snapshot)
++}
++
++func (r *Router) runtimeNodeExposureOutboundForSnapshot(metadata adapter.InboundContext, network string, snapshot *compiledRuntimeRouting) (adapter.Outbound, bool, error) {
++	outboundTag, mapped := r.runtimeInboundOutbound(metadata.Inbound)
++	if !mapped {
++		return nil, false, nil
++	}
++	unhealthy := map[string]struct{}(nil)
++	if snapshot != nil {
++		unhealthy = snapshot.unhealthy
++	}
++	outbound, unavailableReason := r.availableRuntimeOutbound(outboundTag, network, unhealthy)
++	var err error
++	if unavailableReason != "" {
++		err = errors.New(unavailableReason)
++	}
++	decision := "node_exposure"
++	if err != nil {
++		decision += "_failed"
++	}
++	r.recordRuntimeAccessEventForSnapshot(snapshot, metadata, network, outboundTag, "", "", "", decision, err)
++	return outbound, true, err
++}
++
++func (r *Router) shouldPrepareRuntimeMetadata(inboundTag string, snapshot *compiledRuntimeRouting) bool {
++	if snapshot != nil && (len(snapshot.leases) > 0 || len(snapshot.routes) > 0) {
++		return true
++	}
++	_, runtimeInbound := r.runtimeInboundOutbound(inboundTag)
++	return !runtimeInbound
++}
++
+ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) adapter.PreMatchResult {
+ 	ctx := log.ContextWithNewID(r.ctx)
+ 	metadata.PreMatch = true
+ 	continueResult := adapter.PreMatchResult{Action: adapter.PreMatchContinue}
++	if metadata.Network == N.NetworkTCP || metadata.Network == N.NetworkUDP {
++		snapshot := r.runtimeRouting.Load()
++		_, runtimeInbound := r.runtimeInboundOutbound(metadata.Inbound)
++		if runtimeInbound || snapshot != nil && (len(snapshot.leases) > 0 || len(snapshot.routes) > 0) {
++			return continueResult
++		}
++	}
+ 	packetDestination := metadata.Destination
+ 	err := r.prepareMatchMetadata(ctx, &metadata)
+ 	if err != nil {
+@@ -570,7 +722,6 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
+ 	}
+ 	return nil
+ }
+-
+ func (r *Router) matchRule(
+ 	ctx context.Context, metadata *adapter.InboundContext,
+ 	inputConn net.Conn, inputPacketConn N.PacketConn,
+@@ -582,7 +733,16 @@ func (r *Router) matchRule(
+ 	if fatalErr != nil {
+ 		return
+ 	}
++	return r.matchPreparedRule(ctx, metadata, inputConn, inputPacketConn)
++}
+ 
++func (r *Router) matchPreparedRule(
++	ctx context.Context, metadata *adapter.InboundContext,
++	inputConn net.Conn, inputPacketConn N.PacketConn,
++) (
++	selectedRule adapter.Rule, selectedRuleIndex int,
++	buffers []*buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error,
++) {
+ match:
+ 	for currentRuleIndex, currentRule := range r.rules {
+ 		metadata.ResetRuleCache()
+@@ -607,46 +767,7 @@ match:
+ 			}
+ 		}
+ 		if routeOptions != nil {
+-			// TODO: add nat
+-			if (routeOptions.OverrideAddress.IsValid() || routeOptions.OverridePort > 0) && !metadata.RouteOriginalDestination.IsValid() {
+-				metadata.RouteOriginalDestination = metadata.Destination
+-			}
+-			if routeOptions.OverrideAddress.IsValid() {
+-				metadata.DestinationAddresses = nil
+-			}
+-			applyRouteOptionsOverride(metadata, routeOptions)
+-			if routeOptions.NetworkStrategy != nil {
+-				metadata.NetworkStrategy = routeOptions.NetworkStrategy
+-			}
+-			if len(routeOptions.NetworkType) > 0 {
+-				metadata.NetworkType = routeOptions.NetworkType
+-			}
+-			if len(routeOptions.FallbackNetworkType) > 0 {
+-				metadata.FallbackNetworkType = routeOptions.FallbackNetworkType
+-			}
+-			if routeOptions.FallbackDelay != 0 {
+-				metadata.FallbackDelay = routeOptions.FallbackDelay
+-			}
+-			if routeOptions.UDPDisableDomainUnmapping {
+-				metadata.UDPDisableDomainUnmapping = true
+-			}
+-			if routeOptions.UDPConnect {
+-				metadata.UDPConnect = true
+-			}
+-			if routeOptions.UDPTimeout > 0 {
+-				metadata.UDPTimeout = routeOptions.UDPTimeout
+-			}
+-			if routeOptions.TLSFragment {
+-				metadata.TLSFragment = true
+-				metadata.TLSFragmentFallbackDelay = routeOptions.TLSFragmentFallbackDelay
+-			}
+-			if routeOptions.TLSRecordFragment {
+-				metadata.TLSRecordFragment = true
+-			}
+-			if routeOptions.TLSSpoof != "" {
+-				metadata.TLSSpoof = routeOptions.TLSSpoof
+-				metadata.TLSSpoofMethod = routeOptions.TLSSpoofMethod
+-			}
++			applyRouteActionOptions(metadata, routeOptions)
+ 		}
+ 		switch action := currentRule.Action().(type) {
+ 		case *R.RuleActionSniff:
+@@ -687,6 +808,49 @@ match:
+ 	return
+ }
+ 
++func applyRouteActionOptions(metadata *adapter.InboundContext, routeOptions *R.RuleActionRouteOptions) {
++	// TODO: add nat
++	if (routeOptions.OverrideAddress.IsValid() || routeOptions.OverridePort > 0) && !metadata.RouteOriginalDestination.IsValid() {
++		metadata.RouteOriginalDestination = metadata.Destination
++	}
++	if routeOptions.OverrideAddress.IsValid() {
++		metadata.DestinationAddresses = nil
++	}
++	applyRouteOptionsOverride(metadata, routeOptions)
++	if routeOptions.NetworkStrategy != nil {
++		metadata.NetworkStrategy = routeOptions.NetworkStrategy
++	}
++	if len(routeOptions.NetworkType) > 0 {
++		metadata.NetworkType = routeOptions.NetworkType
++	}
++	if len(routeOptions.FallbackNetworkType) > 0 {
++		metadata.FallbackNetworkType = routeOptions.FallbackNetworkType
++	}
++	if routeOptions.FallbackDelay != 0 {
++		metadata.FallbackDelay = routeOptions.FallbackDelay
++	}
++	if routeOptions.UDPDisableDomainUnmapping {
++		metadata.UDPDisableDomainUnmapping = true
++	}
++	if routeOptions.UDPConnect {
++		metadata.UDPConnect = true
++	}
++	if routeOptions.UDPTimeout > 0 {
++		metadata.UDPTimeout = routeOptions.UDPTimeout
++	}
++	if routeOptions.TLSFragment {
++		metadata.TLSFragment = true
++		metadata.TLSFragmentFallbackDelay = routeOptions.TLSFragmentFallbackDelay
++	}
++	if routeOptions.TLSRecordFragment {
++		metadata.TLSRecordFragment = true
++	}
++	if routeOptions.TLSSpoof != "" {
++		metadata.TLSSpoof = routeOptions.TLSSpoof
++		metadata.TLSSpoofMethod = routeOptions.TLSSpoofMethod
++	}
++}
++
+ func (r *Router) actionSniff(
+ 	ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionSniff,
+ 	inputConn net.Conn, inputPacketConn N.PacketConn, inputBuffers []*buf.Buffer, inputPacketBuffers []*N.PacketBuffer,
+diff --git a/route/router.go b/route/router.go
+index 682111d43ffaed8989605e1b5c3464d8ba0d1d0d..663c7d8151e4d15a173eee902f76ad2751321dd4 100644
+--- a/route/router.go
++++ b/route/router.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 	"os"
+ 	"runtime"
++	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+@@ -25,29 +27,33 @@ import (
+ var _ adapter.Router = (*Router)(nil)
+ 
+ type Router struct {
+-	ctx               context.Context
+-	logger            log.ContextLogger
+-	inbound           adapter.InboundManager
+-	outbound          adapter.OutboundManager
+-	dns               adapter.DNSRouter
+-	dnsTransport      adapter.DNSTransportManager
+-	connection        adapter.ConnectionManager
+-	network           adapter.NetworkManager
+-	httpClientManager adapter.HTTPClientManager
+-	rules             []adapter.Rule
+-	needFindProcess   bool
+-	needFindNeighbor  bool
+-	leaseFiles        []string
+-	ruleSets          []adapter.RuleSet
+-	ruleSetMap        map[string]adapter.RuleSet
+-	ruleSetUpdater    *R.RuleSetUpdater
+-	processSearcher   process.Searcher
+-	processCache      *freelru.Cache[processCacheKey, processCacheEntry]
+-	neighborResolver  adapter.NeighborResolver
+-	pauseManager      pause.Manager
+-	trackers          []adapter.ConnectionTracker
+-	platformInterface adapter.PlatformInterface
+-	started           bool
++	ctx                context.Context
++	logger             log.ContextLogger
++	inbound            adapter.InboundManager
++	outbound           adapter.OutboundManager
++	dns                adapter.DNSRouter
++	dnsTransport       adapter.DNSTransportManager
++	connection         adapter.ConnectionManager
++	network            adapter.NetworkManager
++	httpClientManager  adapter.HTTPClientManager
++	rules              []adapter.Rule
++	needFindProcess    bool
++	needFindNeighbor   bool
++	leaseFiles         []string
++	ruleSets           []adapter.RuleSet
++	ruleSetMap         map[string]adapter.RuleSet
++	ruleSetUpdater     *R.RuleSetUpdater
++	processSearcher    process.Searcher
++	processCache       *freelru.Cache[processCacheKey, processCacheEntry]
++	neighborResolver   adapter.NeighborResolver
++	pauseManager       pause.Manager
++	trackers           []adapter.ConnectionTracker
++	platformInterface  adapter.PlatformInterface
++	runtimeRouteAccess sync.RWMutex
++	runtimeOutbounds   map[string]string
++	runtimeRouting     atomic.Pointer[compiledRuntimeRouting]
++	runtimeEvents      runtimeAccessEventRing
++	started            bool
+ }
+ 
+ func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {
+@@ -63,6 +69,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
+ 		httpClientManager: service.FromContext[adapter.HTTPClientManager](ctx),
+ 		rules:             make([]adapter.Rule, 0, len(options.Rules)),
+ 		ruleSetMap:        make(map[string]adapter.RuleSet),
++		runtimeOutbounds:  make(map[string]string),
+ 		needFindProcess:   hasRule(options.Rules, isProcessRule) || hasDNSRule(dnsOptions.Rules, isProcessDNSRule) || options.FindProcess,
+ 		needFindNeighbor:  hasRule(options.Rules, isNeighborRule) || hasDNSRule(dnsOptions.Rules, isNeighborDNSRule) || hasLocalNeighborDNSServer(dnsOptions.Servers) || options.FindNeighbor,
+ 		leaseFiles:        options.DHCPLeaseFiles,
+@@ -71,6 +78,25 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
+ 	}
+ }
+ 
++func (r *Router) SetRuntimeInboundOutbound(inboundTag string, outboundTag string) {
++	r.runtimeRouteAccess.Lock()
++	r.runtimeOutbounds[inboundTag] = outboundTag
++	r.runtimeRouteAccess.Unlock()
++}
++
++func (r *Router) RemoveRuntimeInboundOutbound(inboundTag string) {
++	r.runtimeRouteAccess.Lock()
++	delete(r.runtimeOutbounds, inboundTag)
++	r.runtimeRouteAccess.Unlock()
++}
++
++func (r *Router) runtimeInboundOutbound(inboundTag string) (string, bool) {
++	r.runtimeRouteAccess.RLock()
++	outboundTag, loaded := r.runtimeOutbounds[inboundTag]
++	r.runtimeRouteAccess.RUnlock()
++	return outboundTag, loaded
++}
++
+ func (r *Router) Initialize(rules []option.Rule, ruleSets []option.RuleSet) error {
+ 	for i, options := range rules {
+ 		err := R.ValidateNoNestedRuleActions(options)
+diff --git a/route/runtime_routing.go b/route/runtime_routing.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2f7973119f956494c878dbf796477e079669fea
+--- /dev/null
++++ b/route/runtime_routing.go
+@@ -0,0 +1,656 @@
++package route
++
++import (
++	"errors"
++	"fmt"
++	"net/netip"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++	"unicode"
++	"unicode/utf8"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/common"
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++const (
++	maxRuntimeRoutes           = 1024
++	maxRuntimeLeases           = 4096
++	maxRuntimeUnhealthy        = 4096
++	maxRuntimeValuesPerField   = 1024
++	runtimeAccessEventRingSize = 4096
++)
++
++type compiledRuntimeRouting struct {
++	generation uint64
++	config     adapter.RuntimeRoutingConfig
++	routes     []compiledRuntimeRoute
++	leases     []compiledRuntimeLease
++	unhealthy  map[string]struct{}
++}
++
++type compiledRuntimeRoute struct {
++	value               adapter.RuntimeRoute
++	sourcePrefixes      []netip.Prefix
++	destinationPrefixes []netip.Prefix
++}
++
++type compiledRuntimeLease struct {
++	value        adapter.RuntimeLease
++	sourcePrefix netip.Prefix
++}
++
++type runtimeAccessEventRing struct {
++	access      sync.Mutex
++	items       [runtimeAccessEventRingSize]adapter.RuntimeAccessEvent
++	start       int
++	count       int
++	latest      uint64
++	generation  uint64
++	enabled     bool
++	privacyMode string
++}
++
++type runtimeRoutingMatch struct {
++	outboundTag         string
++	fallbackOutboundTag string
++	routeID             string
++	leaseID             string
++	platform            string
++	kind                string
++}
++
++func emptyRuntimeRoutingConfig() adapter.RuntimeRoutingConfig {
++	return adapter.RuntimeRoutingConfig{
++		Routes:                  []adapter.RuntimeRoute{},
++		Leases:                  []adapter.RuntimeLease{},
++		UnhealthyOutbounds:      []string{},
++		AccessEventsPrivacyMode: adapter.RuntimeAccessPrivacyStrict,
++	}
++}
++
++func (r *Router) ReplaceRuntimeRouting(config adapter.RuntimeRoutingConfig) error {
++	compiled, err := r.compileRuntimeRouting(config)
++	if err != nil {
++		return err
++	}
++	r.runtimeEvents.access.Lock()
++	compiled.generation = r.runtimeEvents.generation + 1
++	if compiled.generation == 0 {
++		compiled.generation = 1
++	}
++	if !compiled.config.AccessEventsEnabled ||
++		r.runtimeEvents.enabled != compiled.config.AccessEventsEnabled ||
++		r.runtimeEvents.privacyMode != compiled.config.AccessEventsPrivacyMode {
++		r.runtimeEvents.clearLocked()
++	}
++	r.runtimeEvents.generation = compiled.generation
++	r.runtimeEvents.enabled = compiled.config.AccessEventsEnabled
++	r.runtimeEvents.privacyMode = compiled.config.AccessEventsPrivacyMode
++	r.runtimeRouting.Store(compiled)
++	r.runtimeEvents.access.Unlock()
++	return nil
++}
++
++func (r *Router) RuntimeRoutingSnapshot() adapter.RuntimeRoutingConfig {
++	snapshot := r.runtimeRouting.Load()
++	if snapshot == nil {
++		return emptyRuntimeRoutingConfig()
++	}
++	return cloneRuntimeRoutingConfig(snapshot.config)
++}
++
++func (r *Router) RuntimeAccessEvents(after uint64, limit int) adapter.RuntimeAccessEventList {
++	return r.runtimeEvents.list(after, limit)
++}
++
++func (r *Router) compileRuntimeRouting(config adapter.RuntimeRoutingConfig) (*compiledRuntimeRouting, error) {
++	if len(config.Routes) > maxRuntimeRoutes {
++		return nil, fmt.Errorf("too many routes: maximum is %d", maxRuntimeRoutes)
++	}
++	if len(config.Leases) > maxRuntimeLeases {
++		return nil, fmt.Errorf("too many leases: maximum is %d", maxRuntimeLeases)
++	}
++	if len(config.UnhealthyOutbounds) > maxRuntimeUnhealthy {
++		return nil, fmt.Errorf("too many unhealthy_outbounds: maximum is %d", maxRuntimeUnhealthy)
++	}
++	compiled := &compiledRuntimeRouting{
++		config:    emptyRuntimeRoutingConfig(),
++		routes:    make([]compiledRuntimeRoute, 0, len(config.Routes)),
++		leases:    make([]compiledRuntimeLease, 0, len(config.Leases)),
++		unhealthy: make(map[string]struct{}, len(config.UnhealthyOutbounds)),
++	}
++	privacyMode := strings.TrimSpace(config.AccessEventsPrivacyMode)
++	if privacyMode == "" {
++		privacyMode = adapter.RuntimeAccessPrivacyStrict
++	}
++	if privacyMode != adapter.RuntimeAccessPrivacyStrict && privacyMode != adapter.RuntimeAccessPrivacyBalanced {
++		return nil, errors.New("access_events_privacy_mode must be strict or balanced")
++	}
++	compiled.config.AccessEventsEnabled = config.AccessEventsEnabled
++	compiled.config.AccessEventsPrivacyMode = privacyMode
++	ids := make(map[string]struct{}, len(config.Routes)+len(config.Leases))
++	for index, route := range config.Routes {
++		normalized, err := r.compileRuntimeRoute(route, ids)
++		if err != nil {
++			return nil, fmt.Errorf("route[%d]: %w", index, err)
++		}
++		compiled.routes = append(compiled.routes, normalized)
++	}
++	sort.SliceStable(compiled.routes, func(i, j int) bool {
++		return compiled.routes[i].value.Priority < compiled.routes[j].value.Priority
++	})
++	for _, route := range compiled.routes {
++		compiled.config.Routes = append(compiled.config.Routes, route.value)
++	}
++	for index, lease := range config.Leases {
++		normalized, err := r.compileRuntimeLease(lease, ids)
++		if err != nil {
++			return nil, fmt.Errorf("lease[%d]: %w", index, err)
++		}
++		compiled.leases = append(compiled.leases, normalized)
++		compiled.config.Leases = append(compiled.config.Leases, normalized.value)
++	}
++	for index, tag := range config.UnhealthyOutbounds {
++		tag, err := r.validateRuntimeOutboundTag(tag, false)
++		if err != nil {
++			return nil, fmt.Errorf("unhealthy_outbounds[%d]: %w", index, err)
++		}
++		if _, exists := compiled.unhealthy[tag]; exists {
++			return nil, fmt.Errorf("unhealthy_outbounds[%d]: duplicate outbound tag %q", index, tag)
++		}
++		compiled.unhealthy[tag] = struct{}{}
++		compiled.config.UnhealthyOutbounds = append(compiled.config.UnhealthyOutbounds, tag)
++	}
++	return compiled, nil
++}
++
++func (r *Router) compileRuntimeRoute(value adapter.RuntimeRoute, ids map[string]struct{}) (compiledRuntimeRoute, error) {
++	var err error
++	value.ID, err = validateRuntimeRoutingID(value.ID, ids)
++	if err != nil {
++		return compiledRuntimeRoute{}, err
++	}
++	value.Platform, err = normalizeRuntimePlatform(value.Platform)
++	if err != nil {
++		return compiledRuntimeRoute{}, err
++	}
++	value.InboundTags, err = normalizeRuntimeStrings("inbound_tags", value.InboundTags, false)
++	if err != nil {
++		return compiledRuntimeRoute{}, err
++	}
++	value.Domains, err = normalizeRuntimeDomains("domains", value.Domains)
++	if err != nil {
++		return compiledRuntimeRoute{}, err
++	}
++	value.DomainSuffixes, err = normalizeRuntimeDomains("domain_suffixes", value.DomainSuffixes)
++	if err != nil {
++		return compiledRuntimeRoute{}, err
++	}
++	value.DomainKeywords, err = normalizeRuntimeStrings("domain_keywords", value.DomainKeywords, true)
++	if err != nil {
++		return compiledRuntimeRoute{}, err
++	}
++	value.OutboundTag, err = r.validateRuntimeOutboundTag(value.OutboundTag, false)
++	if err != nil {
++		return compiledRuntimeRoute{}, err
++	}
++	value.FallbackOutboundTag, err = r.validateRuntimeOutboundTag(value.FallbackOutboundTag, true)
++	if err != nil {
++		return compiledRuntimeRoute{}, err
++	}
++	var sourcePrefixes []netip.Prefix
++	value.SourcePrefixes, sourcePrefixes, err = normalizeRuntimePrefixes("source_prefixes", value.SourcePrefixes)
++	if err != nil {
++		return compiledRuntimeRoute{}, err
++	}
++	var destinationPrefixes []netip.Prefix
++	value.DestinationPrefixes, destinationPrefixes, err = normalizeRuntimePrefixes("destination_prefixes", value.DestinationPrefixes)
++	if err != nil {
++		return compiledRuntimeRoute{}, err
++	}
++	return compiledRuntimeRoute{value: value, sourcePrefixes: sourcePrefixes, destinationPrefixes: destinationPrefixes}, nil
++}
++
++func (r *Router) compileRuntimeLease(value adapter.RuntimeLease, ids map[string]struct{}) (compiledRuntimeLease, error) {
++	var err error
++	value.ID, err = validateRuntimeRoutingID(value.ID, ids)
++	if err != nil {
++		return compiledRuntimeLease{}, err
++	}
++	value.Platform, err = normalizeRuntimePlatform(value.Platform)
++	if err != nil {
++		return compiledRuntimeLease{}, err
++	}
++	value.InboundTags, err = normalizeRuntimeStrings("inbound_tags", value.InboundTags, false)
++	if err != nil {
++		return compiledRuntimeLease{}, err
++	}
++	value.OutboundTag, err = r.validateRuntimeOutboundTag(value.OutboundTag, false)
++	if err != nil {
++		return compiledRuntimeLease{}, err
++	}
++	value.FallbackOutboundTag, err = r.validateRuntimeOutboundTag(value.FallbackOutboundTag, true)
++	if err != nil {
++		return compiledRuntimeLease{}, err
++	}
++	normalizedPrefixes, prefixes, err := normalizeRuntimePrefixes("source_prefix", []string{value.SourcePrefix})
++	if err != nil {
++		return compiledRuntimeLease{}, err
++	}
++	value.SourcePrefix = normalizedPrefixes[0]
++	if value.ExpiresAt < 0 {
++		return compiledRuntimeLease{}, errors.New("expires_at must not be negative")
++	}
++	return compiledRuntimeLease{value: value, sourcePrefix: prefixes[0]}, nil
++}
++
++func (r *Router) validateRuntimeOutboundTag(tag string, optional bool) (string, error) {
++	tag = strings.TrimSpace(tag)
++	if tag == "" {
++		if optional {
++			return "", nil
++		}
++		return "", errors.New("missing outbound_tag")
++	}
++	if !validRuntimeRoutingText(tag, 256) {
++		return "", errors.New("invalid outbound tag")
++	}
++	if r.outbound == nil {
++		return "", errors.New("outbound manager is unavailable")
++	}
++	if _, loaded := r.outbound.Outbound(tag); !loaded {
++		return "", fmt.Errorf("outbound not found: %s", tag)
++	}
++	return tag, nil
++}
++
++func validateRuntimeRoutingID(id string, ids map[string]struct{}) (string, error) {
++	id = strings.TrimSpace(id)
++	if !validRuntimeRoutingText(id, 128) {
++		return "", errors.New("invalid or missing id")
++	}
++	if _, exists := ids[id]; exists {
++		return "", fmt.Errorf("duplicate id %q", id)
++	}
++	ids[id] = struct{}{}
++	return id, nil
++}
++
++func normalizeRuntimePlatform(platform string) (string, error) {
++	platform = strings.TrimSpace(platform)
++	if platform != "" && !validRuntimePlatformLabel(platform) {
++		return "", errors.New("invalid platform")
++	}
++	return platform, nil
++}
++
++func validRuntimePlatformLabel(value string) bool {
++	if value == "" || utf8.RuneCountInString(value) > 64 {
++		return false
++	}
++	for index, character := range value {
++		if unicode.IsLetter(character) || unicode.IsDigit(character) {
++			continue
++		}
++		if index > 0 && (character == '-' || character == '_') {
++			continue
++		}
++		return false
++	}
++	return true
++}
++
++func normalizeRuntimeStrings(field string, values []string, lowercase bool) ([]string, error) {
++	if len(values) > maxRuntimeValuesPerField {
++		return nil, fmt.Errorf("too many %s values: maximum is %d", field, maxRuntimeValuesPerField)
++	}
++	normalized := make([]string, 0, len(values))
++	for index, value := range values {
++		value = strings.TrimSpace(value)
++		if lowercase {
++			value = strings.ToLower(value)
++		}
++		if !validRuntimeRoutingText(value, 253) {
++			return nil, fmt.Errorf("%s[%d] is invalid", field, index)
++		}
++		normalized = append(normalized, value)
++	}
++	return normalized, nil
++}
++
++func normalizeRuntimeDomains(field string, values []string) ([]string, error) {
++	normalized, err := normalizeRuntimeStrings(field, values, true)
++	if err != nil {
++		return nil, err
++	}
++	for index, domain := range normalized {
++		domain = strings.TrimSuffix(domain, ".")
++		if !M.IsDomainName(domain) {
++			return nil, fmt.Errorf("%s[%d] is not a valid domain", field, index)
++		}
++		normalized[index] = domain
++	}
++	return normalized, nil
++}
++
++func normalizeRuntimePrefixes(field string, values []string) ([]string, []netip.Prefix, error) {
++	if len(values) > maxRuntimeValuesPerField {
++		return nil, nil, fmt.Errorf("too many %s values: maximum is %d", field, maxRuntimeValuesPerField)
++	}
++	normalized := make([]string, 0, len(values))
++	prefixes := make([]netip.Prefix, 0, len(values))
++	for index, value := range values {
++		value = strings.TrimSpace(value)
++		prefix, err := netip.ParsePrefix(value)
++		if err != nil {
++			address, addressErr := netip.ParseAddr(value)
++			if addressErr != nil || address.Zone() != "" {
++				return nil, nil, fmt.Errorf("%s[%d] is not a valid CIDR or IP", field, index)
++			}
++			prefix = netip.PrefixFrom(address, address.BitLen())
++		}
++		if prefix.Addr().Is4In6() {
++			return nil, nil, fmt.Errorf("%s[%d] uses an IPv4-mapped IPv6 address", field, index)
++		}
++		prefix = prefix.Masked()
++		normalized = append(normalized, prefix.String())
++		prefixes = append(prefixes, prefix)
++	}
++	return normalized, prefixes, nil
++}
++
++func validRuntimeRoutingText(value string, maxLength int) bool {
++	if value == "" || len(value) > maxLength {
++		return false
++	}
++	for _, character := range value {
++		if character < 0x20 || character == 0x7f {
++			return false
++		}
++	}
++	return true
++}
++
++func cloneRuntimeRoutingConfig(config adapter.RuntimeRoutingConfig) adapter.RuntimeRoutingConfig {
++	cloned := emptyRuntimeRoutingConfig()
++	cloned.AccessEventsEnabled = config.AccessEventsEnabled
++	cloned.AccessEventsPrivacyMode = config.AccessEventsPrivacyMode
++	cloned.UnhealthyOutbounds = append(cloned.UnhealthyOutbounds, config.UnhealthyOutbounds...)
++	for _, value := range config.Routes {
++		value.InboundTags = append([]string{}, value.InboundTags...)
++		value.SourcePrefixes = append([]string{}, value.SourcePrefixes...)
++		value.Domains = append([]string{}, value.Domains...)
++		value.DomainSuffixes = append([]string{}, value.DomainSuffixes...)
++		value.DomainKeywords = append([]string{}, value.DomainKeywords...)
++		value.DestinationPrefixes = append([]string{}, value.DestinationPrefixes...)
++		cloned.Routes = append(cloned.Routes, value)
++	}
++	for _, value := range config.Leases {
++		value.InboundTags = append([]string{}, value.InboundTags...)
++		cloned.Leases = append(cloned.Leases, value)
++	}
++	return cloned
++}
++
++func (r *Router) runtimeRoutingOutbound(metadata adapter.InboundContext, network string) (adapter.Outbound, bool, error) {
++	return r.runtimeRoutingOutboundForSnapshot(metadata, network, r.runtimeRouting.Load())
++}
++
++func (r *Router) runtimeRoutingOutboundForSnapshot(metadata adapter.InboundContext, network string, snapshot *compiledRuntimeRouting) (adapter.Outbound, bool, error) {
++	if snapshot == nil {
++		return nil, false, nil
++	}
++	outbound, selected, err := r.runtimeLeaseOutboundForSnapshot(metadata, network, snapshot)
++	if selected {
++		return outbound, true, err
++	}
++	return r.runtimeRouteOutboundForSnapshot(metadata, network, snapshot)
++}
++
++func (r *Router) runtimeLeaseOutboundForSnapshot(metadata adapter.InboundContext, network string, snapshot *compiledRuntimeRouting) (adapter.Outbound, bool, error) {
++	if snapshot == nil {
++		return nil, false, nil
++	}
++	now := time.Now().UnixMilli()
++	for _, lease := range snapshot.leases {
++		if lease.value.ExpiresAt <= now || !runtimeLeaseMatches(lease, metadata) {
++			continue
++		}
++		return r.resolveRuntimeRoutingMatch(metadata, network, snapshot, runtimeRoutingMatch{
++			outboundTag: lease.value.OutboundTag, fallbackOutboundTag: lease.value.FallbackOutboundTag,
++			leaseID: lease.value.ID, platform: lease.value.Platform, kind: "lease",
++		})
++	}
++	return nil, false, nil
++}
++
++func (r *Router) runtimeRouteOutboundForSnapshot(metadata adapter.InboundContext, network string, snapshot *compiledRuntimeRouting) (adapter.Outbound, bool, error) {
++	if snapshot == nil {
++		return nil, false, nil
++	}
++	for _, route := range snapshot.routes {
++		if !runtimeRouteMatches(route, metadata) {
++			continue
++		}
++		return r.resolveRuntimeRoutingMatch(metadata, network, snapshot, runtimeRoutingMatch{
++			outboundTag: route.value.OutboundTag, fallbackOutboundTag: route.value.FallbackOutboundTag,
++			routeID: route.value.ID, platform: route.value.Platform, kind: "route",
++		})
++	}
++	return nil, false, nil
++}
++
++func runtimeRoutingNeedsRuleMetadata(snapshot *compiledRuntimeRouting, metadata adapter.InboundContext) bool {
++	if snapshot == nil || metadata.Domain != "" || metadata.Destination.Fqdn != "" {
++		return false
++	}
++	for _, route := range snapshot.routes {
++		value := route.value
++		if len(value.Domains) == 0 && len(value.DomainSuffixes) == 0 && len(value.DomainKeywords) == 0 {
++			continue
++		}
++		if runtimeStringDimensionMatches(value.InboundTags, metadata.Inbound) &&
++			runtimePrefixDimensionMatches(route.sourcePrefixes, metadata.Source.Addr) &&
++			runtimePrefixDimensionMatches(route.destinationPrefixes, runtimeDestinationAddress(metadata)) {
++			return true
++		}
++	}
++	return false
++}
++
++func runtimeLeaseMatches(lease compiledRuntimeLease, metadata adapter.InboundContext) bool {
++	return runtimeStringDimensionMatches(lease.value.InboundTags, metadata.Inbound) &&
++		runtimePrefixContains(lease.sourcePrefix, metadata.Source.Addr)
++}
++
++func runtimeRouteMatches(route compiledRuntimeRoute, metadata adapter.InboundContext) bool {
++	domain := strings.ToLower(strings.TrimSuffix(metadata.Domain, "."))
++	if domain == "" {
++		domain = strings.ToLower(strings.TrimSuffix(metadata.Destination.Fqdn, "."))
++	}
++	return runtimeStringDimensionMatches(route.value.InboundTags, metadata.Inbound) &&
++		runtimePrefixDimensionMatches(route.sourcePrefixes, metadata.Source.Addr) &&
++		runtimeDomainDimensionsMatch(route.value, domain) &&
++		runtimePrefixDimensionMatches(route.destinationPrefixes, runtimeDestinationAddress(metadata))
++}
++
++func runtimeStringDimensionMatches(values []string, actual string) bool {
++	return len(values) == 0 || common.Contains(values, actual)
++}
++
++func runtimePrefixDimensionMatches(prefixes []netip.Prefix, address netip.Addr) bool {
++	if len(prefixes) == 0 {
++		return true
++	}
++	for _, prefix := range prefixes {
++		if runtimePrefixContains(prefix, address) {
++			return true
++		}
++	}
++	return false
++}
++
++func runtimePrefixContains(prefix netip.Prefix, address netip.Addr) bool {
++	return address.IsValid() && prefix.Contains(address.Unmap())
++}
++
++func runtimeDomainDimensionsMatch(route adapter.RuntimeRoute, domain string) bool {
++	if len(route.Domains) > 0 && (domain == "" || !common.Contains(route.Domains, domain)) {
++		return false
++	}
++	if len(route.DomainSuffixes) > 0 {
++		matched := false
++		for _, suffix := range route.DomainSuffixes {
++			if domain == suffix || strings.HasSuffix(domain, "."+suffix) {
++				matched = true
++				break
++			}
++		}
++		if !matched {
++			return false
++		}
++	}
++	if len(route.DomainKeywords) > 0 {
++		matched := false
++		for _, keyword := range route.DomainKeywords {
++			if strings.Contains(domain, keyword) {
++				matched = true
++				break
++			}
++		}
++		if !matched {
++			return false
++		}
++	}
++	return true
++}
++
++func (r *Router) resolveRuntimeRoutingMatch(metadata adapter.InboundContext, network string, snapshot *compiledRuntimeRouting, match runtimeRoutingMatch) (adapter.Outbound, bool, error) {
++	outbound, reason := r.availableRuntimeOutbound(match.outboundTag, network, snapshot.unhealthy)
++	decision := match.kind
++	selectedTag := match.outboundTag
++	if reason != "" {
++		if match.fallbackOutboundTag != "" {
++			fallback, fallbackReason := r.availableRuntimeOutbound(match.fallbackOutboundTag, network, snapshot.unhealthy)
++			if fallbackReason == "" {
++				outbound = fallback
++				selectedTag = match.fallbackOutboundTag
++				decision += "_fallback"
++				reason = ""
++			} else {
++				reason = reason + "; fallback unavailable: " + fallbackReason
++			}
++		}
++	}
++	if reason != "" {
++		decision += "_failed"
++		err := errors.New(reason)
++		r.recordRuntimeAccessEventForSnapshot(snapshot, metadata, network, selectedTag, match.platform, match.routeID, match.leaseID, decision, err)
++		return nil, true, err
++	}
++	r.recordRuntimeAccessEventForSnapshot(snapshot, metadata, network, selectedTag, match.platform, match.routeID, match.leaseID, decision, nil)
++	return outbound, true, nil
++}
++
++func (r *Router) availableRuntimeOutbound(tag string, network string, unhealthy map[string]struct{}) (adapter.Outbound, string) {
++	if _, unavailable := unhealthy[tag]; unavailable {
++		return nil, "outbound is unhealthy: " + tag
++	}
++	outbound, loaded := r.outbound.Outbound(tag)
++	if !loaded {
++		return nil, "runtime outbound not found: " + tag
++	}
++	if !common.Contains(outbound.Network(), network) {
++		return nil, network + " is not supported by runtime outbound: " + tag
++	}
++	return outbound, ""
++}
++
++func (r *Router) recordRuntimeAccessEvent(metadata adapter.InboundContext, network string, outboundTag string, platform string, routeID string, leaseID string, decision string, decisionErr error) {
++	r.recordRuntimeAccessEventForSnapshot(r.runtimeRouting.Load(), metadata, network, outboundTag, platform, routeID, leaseID, decision, decisionErr)
++}
++
++func (r *Router) recordRuntimeAccessEventForSnapshot(snapshot *compiledRuntimeRouting, metadata adapter.InboundContext, network string, outboundTag string, platform string, routeID string, leaseID string, decision string, decisionErr error) {
++	if snapshot == nil || !snapshot.config.AccessEventsEnabled {
++		return
++	}
++	domain := metadata.Domain
++	if domain == "" {
++		domain = metadata.Destination.Fqdn
++	}
++	event := adapter.RuntimeAccessEvent{
++		Time: time.Now().UnixMilli(), Network: network, Inbound: metadata.Inbound,
++		SourceIP: runtimeAddressString(metadata.Source.Addr), DestinationIP: runtimeAddressString(runtimeDestinationAddress(metadata)),
++		Domain: domain, OutboundTag: outboundTag, Platform: platform, RouteID: routeID, LeaseID: leaseID, Decision: decision,
++	}
++	if decisionErr != nil {
++		event.Error = decisionErr.Error()
++	}
++	r.runtimeEvents.add(event, snapshot)
++}
++
++func runtimeDestinationAddress(metadata adapter.InboundContext) netip.Addr {
++	if metadata.Destination.Addr.IsValid() {
++		return metadata.Destination.Addr
++	}
++	return metadata.OriginDestination.Addr
++}
++
++func runtimeAddressString(address netip.Addr) string {
++	if !address.IsValid() {
++		return ""
++	}
++	return address.Unmap().String()
++}
++
++func (r *runtimeAccessEventRing) add(event adapter.RuntimeAccessEvent, snapshot *compiledRuntimeRouting) {
++	r.access.Lock()
++	if !r.enabled || snapshot == nil || snapshot.generation != r.generation {
++		r.access.Unlock()
++		return
++	}
++	if snapshot.config.AccessEventsPrivacyMode == adapter.RuntimeAccessPrivacyStrict {
++		event.SourceIP = ""
++		event.DestinationIP = ""
++		event.Domain = ""
++		event.Platform = ""
++	}
++	candidate := uint64(event.Time) << 20
++	if candidate <= r.latest {
++		candidate = r.latest + 1
++	}
++	event.ID = candidate
++	r.latest = candidate
++	if r.count < len(r.items) {
++		r.items[(r.start+r.count)%len(r.items)] = event
++		r.count++
++	} else {
++		r.items[r.start] = event
++		r.start = (r.start + 1) % len(r.items)
++	}
++	r.access.Unlock()
++}
++
++func (r *runtimeAccessEventRing) clearLocked() {
++	r.items = [runtimeAccessEventRingSize]adapter.RuntimeAccessEvent{}
++	r.start = 0
++	r.count = 0
++}
++
++func (r *runtimeAccessEventRing) list(after uint64, limit int) adapter.RuntimeAccessEventList {
++	result := adapter.RuntimeAccessEventList{Items: []adapter.RuntimeAccessEvent{}}
++	r.access.Lock()
++	result.LatestID = r.latest
++	for index := 0; index < r.count && len(result.Items) < limit; index++ {
++		event := r.items[(r.start+index)%len(r.items)]
++		if event.ID > after {
++			result.Items = append(result.Items, event)
++		}
++	}
++	r.access.Unlock()
++	return result
++}
+diff --git a/service/api/runtime_node_exposure.go b/service/api/runtime_node_exposure.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..35e18276ec66364e8040fa5ba1f0f5af1c9fb07f
+--- /dev/null
++++ b/service/api/runtime_node_exposure.go
+@@ -0,0 +1,474 @@
++package api
++
++import (
++	"context"
++	"crypto/subtle"
++	stdJSON "encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/netip"
++	"sort"
++	"strings"
++	"sync"
++	"sync/atomic"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/json"
++	"github.com/sagernet/sing/service"
++)
++
++const (
++	runtimeAPIPrefix             = "/api/v1/"
++	runtimeNodeExposurePath      = runtimeAPIPrefix + "node-exposures"
++	runtimeNodeExposureBodyLimit = 1 << 20
++	runtimeNodeExposureTagPrefix = "ackwrap-node-exposure-"
++)
++
++var (
++	errRuntimeAPIUnavailable       = errors.New("runtime API is unavailable")
++	errRuntimeAPIConflict          = errors.New("runtime resource already exists")
++	errRuntimeNodeExposureNotFound = errors.New("runtime node exposure not found")
++)
++
++type runtimeAPI struct {
++	ctx             context.Context
++	logger          log.ContextLogger
++	secret          string
++	inboundManager  adapter.InboundManager
++	outboundManager adapter.OutboundManager
++	router          adapter.Router
++	runtimeRouter   adapter.RuntimeRouteManager
++
++	access    sync.Mutex
++	exposures map[string]runtimeNodeExposure
++	closing   atomic.Bool
++}
++
++type runtimeNodeExposureRequest struct {
++	Inbound     option.Inbound `json:"inbound"`
++	OutboundTag string         `json:"outbound_tag"`
++}
++
++type runtimeNodeExposure struct {
++	ID           string
++	Inbound      option.Inbound
++	OutboundTag  string
++	OutboundType string
++	Active       bool
++}
++
++type runtimeNodeExposureSummary struct {
++	ID           string `json:"id"`
++	InboundTag   string `json:"inbound_tag"`
++	InboundType  string `json:"inbound_type"`
++	OutboundTag  string `json:"outbound_tag"`
++	OutboundType string `json:"outbound_type"`
++}
++
++type runtimeNodeExposureList struct {
++	Items []runtimeNodeExposureSummary `json:"items"`
++}
++
++type runtimeAPIErrorEnvelope struct {
++	Error runtimeAPIError `json:"error"`
++}
++
++type runtimeAPIError struct {
++	Code    string `json:"code"`
++	Message string `json:"message"`
++}
++
++func newRuntimeAPI(ctx context.Context, logger log.ContextLogger, secret string) *runtimeAPI {
++	router := service.FromContext[adapter.Router](ctx)
++	runtimeRouter, _ := router.(adapter.RuntimeRouteManager)
++	return &runtimeAPI{
++		ctx:             ctx,
++		logger:          logger,
++		secret:          secret,
++		inboundManager:  service.FromContext[adapter.InboundManager](ctx),
++		outboundManager: service.FromContext[adapter.OutboundManager](ctx),
++		router:          router,
++		runtimeRouter:   runtimeRouter,
++		exposures:       make(map[string]runtimeNodeExposure),
++	}
++}
++
++func (a *runtimeAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
++	if !a.authenticate(request) {
++		writer.Header().Set("WWW-Authenticate", "Bearer")
++		writeRuntimeAPIError(writer, http.StatusUnauthorized, "UNAUTHORIZED", "invalid authorization")
++		return
++	}
++	if request.URL.Path == runtimeAPIPrefix+"health" {
++		if request.Method != http.MethodGet {
++			writeRuntimeAPIError(writer, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
++			return
++		}
++		if !a.ready() {
++			writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
++			return
++		}
++		writeRuntimeAPIJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
++		return
++	}
++	if request.URL.Path == runtimeRoutingPath {
++		a.handleRuntimeRouting(writer, request)
++		return
++	}
++	if request.URL.Path == runtimeAccessEventsPath {
++		a.handleRuntimeAccessEvents(writer, request)
++		return
++	}
++	if request.URL.Path == runtimeNodeExposurePath {
++		if request.Method != http.MethodGet {
++			writeRuntimeAPIError(writer, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
++			return
++		}
++		writeRuntimeAPIJSON(writer, http.StatusOK, a.list())
++		return
++	}
++	pathID, found := strings.CutPrefix(request.URL.Path, runtimeNodeExposurePath+"/")
++	if !found || !validRuntimeExposureID(pathID) {
++		writeRuntimeAPIError(writer, http.StatusNotFound, "NOT_FOUND", "resource not found")
++		return
++	}
++	switch request.Method {
++	case http.MethodPut:
++		a.handlePut(writer, request, pathID)
++	case http.MethodDelete:
++		a.handleDelete(writer, pathID)
++	default:
++		writeRuntimeAPIError(writer, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
++	}
++}
++
++func (a *runtimeAPI) handlePut(writer http.ResponseWriter, request *http.Request, id string) {
++	if !a.ready() {
++		writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
++		return
++	}
++	content, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, runtimeNodeExposureBodyLimit))
++	if err != nil {
++		writeRuntimeAPIError(writer, http.StatusBadRequest, "INVALID_REQUEST", "request body is too large or unreadable")
++		return
++	}
++	exposure, err := a.parseExposure(id, content)
++	if err != nil {
++		writeRuntimeAPIError(writer, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
++		return
++	}
++	err = a.upsert(exposure)
++	if err != nil {
++		if errors.Is(err, errRuntimeAPIUnavailable) {
++			writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
++			return
++		}
++		if errors.Is(err, errRuntimeAPIConflict) {
++			writeRuntimeAPIError(writer, http.StatusConflict, "RESOURCE_CONFLICT", err.Error())
++			return
++		}
++		writeRuntimeAPIError(writer, http.StatusInternalServerError, "RUNTIME_APPLY_FAILED", err.Error())
++		return
++	}
++	writeRuntimeAPIJSON(writer, http.StatusOK, exposure.summary())
++}
++
++func (a *runtimeAPI) handleDelete(writer http.ResponseWriter, id string) {
++	if !a.ready() {
++		writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
++		return
++	}
++	err := a.delete(id)
++	if errors.Is(err, errRuntimeAPIUnavailable) {
++		writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
++		return
++	}
++	if errors.Is(err, errRuntimeNodeExposureNotFound) {
++		writeRuntimeAPIError(writer, http.StatusNotFound, "NOT_FOUND", "node exposure not found")
++		return
++	}
++	if err != nil {
++		writeRuntimeAPIError(writer, http.StatusInternalServerError, "RUNTIME_APPLY_FAILED", err.Error())
++		return
++	}
++	writer.WriteHeader(http.StatusNoContent)
++}
++
++func (a *runtimeAPI) ready() bool {
++	return !a.closing.Load() && a.inboundManager != nil && a.outboundManager != nil && a.router != nil && a.runtimeRouter != nil
++}
++
++func (a *runtimeAPI) authenticate(request *http.Request) bool {
++	if a.secret == "" {
++		return false
++	}
++	token, found := strings.CutPrefix(request.Header.Get("Authorization"), "Bearer ")
++	if !found || len(token) != len(a.secret) {
++		return false
++	}
++	return subtle.ConstantTimeCompare([]byte(token), []byte(a.secret)) == 1
++}
++
++func (a *runtimeAPI) parseExposure(id string, content []byte) (runtimeNodeExposure, error) {
++	request, err := json.UnmarshalExtendedContext[runtimeNodeExposureRequest](a.ctx, content)
++	if err != nil {
++		return runtimeNodeExposure{}, E.Cause(err, "decode node exposure")
++	}
++	request.OutboundTag = strings.TrimSpace(request.OutboundTag)
++	if request.OutboundTag == "" {
++		return runtimeNodeExposure{}, errors.New("missing outbound_tag")
++	}
++	switch request.Inbound.Type {
++	case C.TypeHTTP, C.TypeSOCKS, C.TypeMixed:
++	default:
++		return runtimeNodeExposure{}, E.New("unsupported inbound type: ", request.Inbound.Type)
++	}
++	listenWrapper, loaded := request.Inbound.Options.(option.ListenOptionsWrapper)
++	if !loaded {
++		return runtimeNodeExposure{}, errors.New("inbound does not support listen options")
++	}
++	listenOptions := listenWrapper.TakeListenOptions()
++	if listenOptions.ListenPort == 0 {
++		return runtimeNodeExposure{}, errors.New("listen_port must be greater than zero")
++	}
++	if listenOptions.Detour != "" {
++		return runtimeNodeExposure{}, errors.New("inbound detour is not supported")
++	}
++	users, setSystemProxy := runtimeInboundSecurity(request.Inbound.Options)
++	if setSystemProxy {
++		return runtimeNodeExposure{}, errors.New("set_system_proxy is not supported")
++	}
++	if users == 0 && (listenOptions.Listen == nil || !netip.Addr(*listenOptions.Listen).IsLoopback()) {
++		return runtimeNodeExposure{}, errors.New("authentication is required for non-loopback listeners")
++	}
++	request.Inbound.Tag = runtimeNodeExposureTagPrefix + "in-" + id
++	targetOutbound, loaded := a.outboundManager.Outbound(request.OutboundTag)
++	if !loaded {
++		return runtimeNodeExposure{}, E.New("outbound not found: ", request.OutboundTag)
++	}
++	return runtimeNodeExposure{
++		ID:           id,
++		Inbound:      request.Inbound,
++		OutboundTag:  request.OutboundTag,
++		OutboundType: targetOutbound.Type(),
++	}, nil
++}
++
++func runtimeInboundSecurity(options any) (users int, setSystemProxy bool) {
++	switch inboundOptions := options.(type) {
++	case *option.SocksInboundOptions:
++		return len(inboundOptions.Users), false
++	case *option.HTTPMixedInboundOptions:
++		return len(inboundOptions.Users), inboundOptions.SetSystemProxy
++	default:
++		return 0, false
++	}
++}
++
++func validRuntimeExposureID(id string) bool {
++	if len(id) == 0 || len(id) > 64 {
++		return false
++	}
++	for index, character := range id {
++		isLetter := character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z'
++		isDigit := character >= '0' && character <= '9'
++		isSeparator := index > 0 && (character == '-' || character == '_')
++		if isLetter || isDigit || isSeparator {
++			continue
++		}
++		return false
++	}
++	return true
++}
++
++func (a *runtimeAPI) list() runtimeNodeExposureList {
++	a.access.Lock()
++	items := make([]runtimeNodeExposureSummary, 0, len(a.exposures))
++	for _, exposure := range a.exposures {
++		if exposure.Active {
++			items = append(items, exposure.summary())
++		}
++	}
++	a.access.Unlock()
++	sort.Slice(items, func(i int, j int) bool { return items[i].ID < items[j].ID })
++	return runtimeNodeExposureList{Items: items}
++}
++
++func (a *runtimeAPI) upsert(exposure runtimeNodeExposure) error {
++	if a.closing.Load() {
++		return errRuntimeAPIUnavailable
++	}
++	a.access.Lock()
++	defer a.access.Unlock()
++	if a.closing.Load() {
++		return errRuntimeAPIUnavailable
++	}
++	existing, loaded := a.exposures[exposure.ID]
++	if loaded {
++		if !existing.Active {
++			if err := a.cleanupInactiveLocked(existing); err != nil {
++				return E.Cause(err, "clean incomplete runtime exposure")
++			}
++			delete(a.exposures, existing.ID)
++			return a.createLocked(exposure)
++		}
++		return a.updateLocked(existing, exposure)
++	}
++	return a.createLocked(exposure)
++}
++
++func (a *runtimeAPI) createLocked(exposure runtimeNodeExposure) error {
++	if _, loaded := a.inboundManager.Get(exposure.Inbound.Tag); loaded {
++		return E.Cause(errRuntimeAPIConflict, "inbound tag ", exposure.Inbound.Tag)
++	}
++	if err := a.validateTarget(exposure); err != nil {
++		return err
++	}
++	a.runtimeRouter.SetRuntimeInboundOutbound(exposure.Inbound.Tag, exposure.OutboundTag)
++	if err := a.createInbound(exposure); err != nil {
++		a.runtimeRouter.RemoveRuntimeInboundOutbound(exposure.Inbound.Tag)
++		return E.Cause(err, "create runtime inbound")
++	}
++	exposure.Active = true
++	a.exposures[exposure.ID] = exposure
++	a.logger.Info("runtime node exposure created: ", exposure.ID, " (", exposure.Inbound.Type, " -> ", exposure.OutboundType, ")")
++	return nil
++}
++
++func (a *runtimeAPI) updateLocked(existing runtimeNodeExposure, exposure runtimeNodeExposure) error {
++	if err := a.inboundManager.Remove(existing.Inbound.Tag); err != nil {
++		return a.restoreLocked(existing, E.Cause(err, "remove previous runtime inbound"))
++	}
++	if err := a.validateTarget(exposure); err != nil {
++		return a.restoreLocked(existing, err)
++	}
++	a.runtimeRouter.SetRuntimeInboundOutbound(exposure.Inbound.Tag, exposure.OutboundTag)
++	if err := a.createInbound(exposure); err != nil {
++		return a.restoreLocked(existing, E.Cause(err, "create replacement runtime inbound"))
++	}
++	exposure.Active = true
++	a.exposures[exposure.ID] = exposure
++	a.logger.Info("runtime node exposure updated: ", exposure.ID, " (", exposure.Inbound.Type, " -> ", exposure.OutboundType, ")")
++	return nil
++}
++
++func (a *runtimeAPI) delete(id string) error {
++	if a.closing.Load() {
++		return errRuntimeAPIUnavailable
++	}
++	a.access.Lock()
++	defer a.access.Unlock()
++	if a.closing.Load() {
++		return errRuntimeAPIUnavailable
++	}
++	existing, loaded := a.exposures[id]
++	if !loaded {
++		return errRuntimeNodeExposureNotFound
++	}
++	if !existing.Active {
++		if err := a.cleanupInactiveLocked(existing); err != nil {
++			return E.Cause(err, "clean incomplete runtime exposure")
++		}
++		delete(a.exposures, id)
++		return nil
++	}
++	if err := a.inboundManager.Remove(existing.Inbound.Tag); err != nil {
++		return a.restoreLocked(existing, E.Cause(err, "remove runtime inbound"))
++	}
++	a.runtimeRouter.RemoveRuntimeInboundOutbound(existing.Inbound.Tag)
++	delete(a.exposures, id)
++	a.logger.Info("runtime node exposure deleted: ", id)
++	return nil
++}
++
++func (a *runtimeAPI) Close() error {
++	a.closing.Store(true)
++	a.access.Lock()
++	defer a.access.Unlock()
++	var closeErr error
++	for id, exposure := range a.exposures {
++		cleanupErr := a.cleanupInactiveLocked(exposure)
++		if cleanupErr != nil {
++			exposure.Active = false
++			a.exposures[id] = exposure
++			closeErr = errors.Join(closeErr, E.Cause(cleanupErr, "close runtime node exposure ", id))
++			continue
++		}
++		delete(a.exposures, id)
++	}
++	return closeErr
++}
++
++func (a *runtimeAPI) restoreLocked(existing runtimeNodeExposure, operationErr error) error {
++	a.runtimeRouter.SetRuntimeInboundOutbound(existing.Inbound.Tag, existing.OutboundTag)
++	rollbackErr := a.ensureInbound(existing)
++	existing.Active = rollbackErr == nil
++	a.exposures[existing.ID] = existing
++	return runtimeRollbackError(operationErr, rollbackErr)
++}
++
++func (a *runtimeAPI) cleanupInactiveLocked(exposure runtimeNodeExposure) error {
++	cleanupErr := a.removeInboundIfPresent(exposure.Inbound.Tag)
++	if cleanupErr == nil {
++		a.runtimeRouter.RemoveRuntimeInboundOutbound(exposure.Inbound.Tag)
++	}
++	return cleanupErr
++}
++
++func (a *runtimeAPI) ensureInbound(exposure runtimeNodeExposure) error {
++	if _, loaded := a.inboundManager.Get(exposure.Inbound.Tag); loaded {
++		return nil
++	}
++	return a.createInbound(exposure)
++}
++
++func (a *runtimeAPI) removeInboundIfPresent(tag string) error {
++	if _, loaded := a.inboundManager.Get(tag); !loaded {
++		return nil
++	}
++	return a.inboundManager.Remove(tag)
++}
++
++func (a *runtimeAPI) createInbound(exposure runtimeNodeExposure) error {
++	return a.inboundManager.Create(a.ctx, a.router, a.logger, exposure.Inbound.Tag, exposure.Inbound.Type, exposure.Inbound.Options)
++}
++
++func (a *runtimeAPI) validateTarget(exposure runtimeNodeExposure) error {
++	if _, loaded := a.outboundManager.Outbound(exposure.OutboundTag); !loaded {
++		return E.New("runtime outbound not found: ", exposure.OutboundTag)
++	}
++	return nil
++}
++
++func (e runtimeNodeExposure) summary() runtimeNodeExposureSummary {
++	return runtimeNodeExposureSummary{
++		ID:           e.ID,
++		InboundTag:   e.Inbound.Tag,
++		InboundType:  e.Inbound.Type,
++		OutboundTag:  e.OutboundTag,
++		OutboundType: e.OutboundType,
++	}
++}
++
++func runtimeRollbackError(operationErr error, rollbackErr error) error {
++	if rollbackErr == nil {
++		return operationErr
++	}
++	return fmt.Errorf("%w; rollback failed: %v", operationErr, rollbackErr)
++}
++
++func writeRuntimeAPIError(writer http.ResponseWriter, statusCode int, code string, message string) {
++	writeRuntimeAPIJSON(writer, statusCode, runtimeAPIErrorEnvelope{Error: runtimeAPIError{Code: code, Message: message}})
++}
++
++func writeRuntimeAPIJSON(writer http.ResponseWriter, statusCode int, value any) {
++	writer.Header().Set("Content-Type", "application/json")
++	writer.WriteHeader(statusCode)
++	_ = stdJSON.NewEncoder(writer).Encode(value)
++}
+diff --git a/service/api/runtime_routing.go b/service/api/runtime_routing.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..db7dab743e1ca764f59d6dd68632223f74af4730
+--- /dev/null
++++ b/service/api/runtime_routing.go
+@@ -0,0 +1,183 @@
++package api
++
++import (
++	"bytes"
++	stdJSON "encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"strconv"
++
++	"github.com/sagernet/sing-box/adapter"
++)
++
++const (
++	runtimeRoutingPath         = runtimeAPIPrefix + "runtime-routing"
++	runtimeAccessEventsPath    = runtimeAPIPrefix + "access-events"
++	runtimeRoutingBodyLimit    = 1 << 20
++	runtimeAccessEventsLimit   = 500
++	runtimeAccessEventsDefault = 100
++)
++
++func (a *runtimeAPI) handleRuntimeRouting(writer http.ResponseWriter, request *http.Request) {
++	if !a.routingReady() {
++		writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
++		return
++	}
++	switch request.Method {
++	case http.MethodGet:
++		config, err := a.runtimeRoutingSnapshot()
++		if err != nil {
++			writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
++			return
++		}
++		writeRuntimeAPIJSON(writer, http.StatusOK, config)
++	case http.MethodPut:
++		content, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, runtimeRoutingBodyLimit))
++		if err != nil {
++			writeRuntimeAPIError(writer, http.StatusBadRequest, "INVALID_REQUEST", "request body is too large or unreadable")
++			return
++		}
++		config, err := decodeRuntimeRoutingConfig(content)
++		if err != nil {
++			writeRuntimeAPIError(writer, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
++			return
++		}
++		updated, err := a.replaceRuntimeRoutingAndSnapshot(config)
++		if err != nil {
++			if errors.Is(err, errRuntimeAPIUnavailable) {
++				writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
++				return
++			}
++			writeRuntimeAPIError(writer, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
++			return
++		}
++		writeRuntimeAPIJSON(writer, http.StatusOK, updated)
++	default:
++		writeRuntimeAPIError(writer, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
++	}
++}
++
++func (a *runtimeAPI) handleRuntimeAccessEvents(writer http.ResponseWriter, request *http.Request) {
++	if !a.routingReady() {
++		writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
++		return
++	}
++	if request.Method != http.MethodGet {
++		writeRuntimeAPIError(writer, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
++		return
++	}
++	after, limit, err := parseRuntimeAccessEventQuery(request)
++	if err != nil {
++		writeRuntimeAPIError(writer, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
++		return
++	}
++	events, err := a.runtimeAccessEvents(after, limit)
++	if err != nil {
++		writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
++		return
++	}
++	writeRuntimeAPIJSON(writer, http.StatusOK, events)
++}
++
++func (a *runtimeAPI) routingReady() bool {
++	return !a.closing.Load() && a.outboundManager != nil && a.runtimeRouter != nil
++}
++
++func decodeRuntimeRoutingConfig(content []byte) (adapter.RuntimeRoutingConfig, error) {
++	var request struct {
++		Routes                  *[]adapter.RuntimeRoute `json:"routes"`
++		Leases                  *[]adapter.RuntimeLease `json:"leases"`
++		UnhealthyOutbounds      *[]string               `json:"unhealthy_outbounds"`
++		AccessEventsEnabled     *bool                   `json:"access_events_enabled"`
++		AccessEventsPrivacyMode *string                 `json:"access_events_privacy_mode"`
++	}
++	decoder := stdJSON.NewDecoder(bytes.NewReader(content))
++	decoder.DisallowUnknownFields()
++	if err := decoder.Decode(&request); err != nil {
++		return adapter.RuntimeRoutingConfig{}, errors.New("invalid runtime routing JSON: " + err.Error())
++	}
++	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
++		if err == nil {
++			return adapter.RuntimeRoutingConfig{}, errors.New("invalid runtime routing JSON: multiple values")
++		}
++		return adapter.RuntimeRoutingConfig{}, errors.New("invalid runtime routing JSON: " + err.Error())
++	}
++	if request.Routes == nil || request.Leases == nil || request.UnhealthyOutbounds == nil || request.AccessEventsEnabled == nil || request.AccessEventsPrivacyMode == nil {
++		return adapter.RuntimeRoutingConfig{}, errors.New("routes, leases, unhealthy_outbounds, access_events_enabled, and access_events_privacy_mode are required")
++	}
++	return adapter.RuntimeRoutingConfig{
++		Routes:                  *request.Routes,
++		Leases:                  *request.Leases,
++		UnhealthyOutbounds:      *request.UnhealthyOutbounds,
++		AccessEventsEnabled:     *request.AccessEventsEnabled,
++		AccessEventsPrivacyMode: *request.AccessEventsPrivacyMode,
++	}, nil
++}
++
++func parseRuntimeAccessEventQuery(request *http.Request) (uint64, int, error) {
++	query := request.URL.Query()
++	for key, values := range query {
++		if key != "after" && key != "limit" {
++			return 0, 0, errors.New("unknown query parameter: " + key)
++		}
++		if len(values) != 1 {
++			return 0, 0, errors.New("query parameter must be specified once: " + key)
++		}
++	}
++	var after uint64
++	if values, exists := query["after"]; exists {
++		value := values[0]
++		if value == "" {
++			return 0, 0, errors.New("after must be an unsigned 64-bit integer")
++		}
++		parsed, err := strconv.ParseUint(value, 10, 64)
++		if err != nil {
++			return 0, 0, errors.New("after must be an unsigned 64-bit integer")
++		}
++		after = parsed
++	}
++	limit := runtimeAccessEventsDefault
++	if values, exists := query["limit"]; exists {
++		value := values[0]
++		if value == "" {
++			return 0, 0, errors.New("limit must be between 1 and 500")
++		}
++		parsed, err := strconv.Atoi(value)
++		if err != nil || parsed < 1 || parsed > runtimeAccessEventsLimit {
++			return 0, 0, errors.New("limit must be between 1 and 500")
++		}
++		limit = parsed
++	}
++	return after, limit, nil
++}
++
++func (a *runtimeAPI) replaceRuntimeRoutingAndSnapshot(config adapter.RuntimeRoutingConfig) (adapter.RuntimeRoutingConfig, error) {
++	a.access.Lock()
++	defer a.access.Unlock()
++	if a.closing.Load() || a.runtimeRouter == nil {
++		return adapter.RuntimeRoutingConfig{}, errRuntimeAPIUnavailable
++	}
++	if err := a.runtimeRouter.ReplaceRuntimeRouting(config); err != nil {
++		return adapter.RuntimeRoutingConfig{}, err
++	}
++	return a.runtimeRouter.RuntimeRoutingSnapshot(), nil
++}
++
++func (a *runtimeAPI) runtimeRoutingSnapshot() (adapter.RuntimeRoutingConfig, error) {
++	a.access.Lock()
++	defer a.access.Unlock()
++	if a.closing.Load() || a.runtimeRouter == nil {
++		return adapter.RuntimeRoutingConfig{}, errRuntimeAPIUnavailable
++	}
++	return a.runtimeRouter.RuntimeRoutingSnapshot(), nil
++}
++
++func (a *runtimeAPI) runtimeAccessEvents(after uint64, limit int) (adapter.RuntimeAccessEventList, error) {
++	a.access.Lock()
++	defer a.access.Unlock()
++	if a.closing.Load() || a.runtimeRouter == nil {
++		return adapter.RuntimeAccessEventList{}, errRuntimeAPIUnavailable
++	}
++	return a.runtimeRouter.RuntimeAccessEvents(after, limit), nil
++}
+diff --git a/service/api/server.go b/service/api/server.go
+index 658e656426bd308c91e9ce45f56a1f862ea4e034..8000835002204d7a326b5174e58969c97b832fae 100644
+--- a/service/api/server.go
++++ b/service/api/server.go
+@@ -39,6 +39,7 @@ type Service struct {
+ 	grpcServer     *grpc.Server
+ 	httpServer     *http.Server
+ 	dashboard      *dashboard
++	runtimeAPI     *runtimeAPI
+ }
+ 
+ func NewService(ctx context.Context, logger log.ContextLogger, tag string, options option.APIServiceOptions) (adapter.Service, error) {
+@@ -67,6 +68,9 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
+ 	if options.Dashboard != nil && options.Dashboard.Enabled {
+ 		s.dashboard = newDashboard(ctx, logger, *options.Dashboard)
+ 	}
++	if options.Secret != "" {
++		s.runtimeAPI = newRuntimeAPI(ctx, logger, options.Secret)
++	}
+ 	return s, nil
+ }
+ 
+@@ -84,7 +88,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
+ 	}
+ 	s.httpServer = &http.Server{
+ 		//nolint:staticcheck
+-		Handler: h2c.NewHandler(newHTTPHandler(s.logger, s.grpcServer, s.options, s.dashboard), new(http2.Server)),
++		Handler: h2c.NewHandler(newHTTPHandler(s.logger, s.grpcServer, s.options, s.dashboard, s.runtimeAPI), new(http2.Server)),
+ 		BaseContext: func(net.Listener) context.Context {
+ 			return s.ctx
+ 		},
+@@ -122,8 +126,16 @@ func (s *Service) Close() error {
+ 	if s.dashboard != nil {
+ 		s.dashboard.close()
+ 	}
++	var err error
+ 	if s.httpServer != nil {
+-		s.httpServer.Close()
++		err = E.Append(err, s.httpServer.Close(), func(closeErr error) error {
++			return E.Cause(closeErr, "close HTTP server")
++		})
++	}
++	if s.runtimeAPI != nil {
++		err = E.Append(err, s.runtimeAPI.Close(), func(closeErr error) error {
++			return E.Cause(closeErr, "close runtime API")
++		})
+ 	}
+ 	if s.grpcServer != nil {
+ 		s.grpcServer.Stop()
+@@ -131,8 +143,9 @@ func (s *Service) Close() error {
+ 	if s.startedService != nil {
+ 		s.startedService.Close()
+ 	}
+-	return common.Close(
++	err = E.Append(err, common.Close(
+ 		common.PtrOrNil(s.listener),
+ 		s.tlsConfig,
+-	)
++	), func(closeErr error) error { return closeErr })
++	return err
+ }
+diff --git a/service/api/web_bridge.go b/service/api/web_bridge.go
+index 39c2568743dd8db425e3197182b6caec5ac70c0f..1e81583f617eb2fee4284db7e2690d699b81ccf0 100644
+--- a/service/api/web_bridge.go
++++ b/service/api/web_bridge.go
+@@ -26,14 +26,14 @@ const (
+ // (https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md) and gRPC-Web
+ // streams over WebSocket, wire compatible with the improbable-eng/grpc-web
+ // client transports.
+-func newHTTPHandler(logger log.ContextLogger, grpcServer *grpc.Server, options option.APIServiceOptions, dashboard *dashboard) http.Handler {
++func newHTTPHandler(logger log.ContextLogger, grpcServer *grpc.Server, options option.APIServiceOptions, dashboard *dashboard, runtimeAPI *runtimeAPI) http.Handler {
+ 	allowedOrigins := options.AccessControlAllowOrigin
+ 	if len(allowedOrigins) == 0 {
+ 		allowedOrigins = []string{"*"}
+ 	}
+ 	corsHandler := cors.New(cors.Options{
+ 		AllowedOrigins:      allowedOrigins,
+-		AllowedMethods:      []string{http.MethodGet, http.MethodPost, http.MethodOptions},
++		AllowedMethods:      []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions},
+ 		AllowedHeaders:      []string{"Content-Type", "Authorization", "X-Grpc-Web", "X-User-Agent", "Grpc-Timeout"},
+ 		ExposedHeaders:      []string{"Grpc-Status", "Grpc-Message", "Grpc-Status-Details-Bin"},
+ 		AllowPrivateNetwork: options.AccessControlAllowPrivateNetwork,
+@@ -43,6 +43,7 @@ func newHTTPHandler(logger log.ContextLogger, grpcServer *grpc.Server, options o
+ 		logger:     logger,
+ 		grpcServer: grpcServer,
+ 		dashboard:  dashboard,
++		runtimeAPI: runtimeAPI,
+ 	})
+ }
+ 
+@@ -50,6 +51,7 @@ type webBridge struct {
+ 	logger     log.ContextLogger
+ 	grpcServer *grpc.Server
+ 	dashboard  *dashboard
++	runtimeAPI *runtimeAPI
+ }
+ 
+ func (b *webBridge) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+@@ -61,6 +63,12 @@ func (b *webBridge) ServeHTTP(writer http.ResponseWriter, request *http.Request)
+ 		b.serveWeb(writer, request)
+ 	case request.ProtoMajor == 2 && strings.HasPrefix(contentType, contentTypeGRPC):
+ 		b.grpcServer.ServeHTTP(writer, request)
++	case strings.HasPrefix(request.URL.Path, runtimeAPIPrefix):
++		if b.runtimeAPI == nil {
++			http.NotFound(writer, request)
++		} else {
++			b.runtimeAPI.ServeHTTP(writer, request)
++		}
+ 	case b.dashboard != nil:
+ 		b.dashboard.serveHTTP(writer, request)
+ 	default:

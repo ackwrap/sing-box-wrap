@@ -1,0 +1,287 @@
+diff --git a/change/certificate-sha256.md b/change/certificate-sha256.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..85ee651a55510c915fcb454fe8e7c2b96c3c74a6
+--- /dev/null
++++ b/change/certificate-sha256.md
+@@ -0,0 +1,24 @@
++# Certificate SHA-256 Pin Maintenance Record
++
++## Scope
++
++Ackwrap's sing-box fork adds an outbound TLS `certificate_sha256` option for protocols such as Hysteria2 whose shared URI pins the complete leaf certificate rather than its public key.
++
++## Semantics
++
++- `certificate_sha256` hashes the leaf certificate DER bytes from `rawCerts[0]` with SHA-256.
++- Values are 64-character hexadecimal fingerprints. Uppercase, colon-separated, and hyphen-separated forms are accepted.
++- A configured certificate pin is enforced in addition to normal CA and hostname verification. Self-signed Hysteria2 certificates require `insecure: true`, and the pin remains enforced in that mode.
++- `certificate_public_key_sha256` keeps its existing SPKI public-key semantics.
++- Complete-certificate and public-key pins cannot be configured together.
++
++## TLS Engines
++
++The Go standard TLS, uTLS, Windows Schannel, and Apple Network.framework clients enforce the complete-certificate pin after the handshake exposes the peer certificate. The Apple HTTP engine rejects this option explicitly because its URLSession path cannot apply the same verifier.
++
++## Verification
++
++```bash
++go test ./common/tls ./common/httpclient
++go build ./cmd/sing-box
++```
+diff --git a/common/httpclient/apple_transport_darwin.go b/common/httpclient/apple_transport_darwin.go
+index 36584f9cf55292c3b06245517a6f415622dec0ab..2cfb2b17b22dbd194282b4b70484c5a7c94e1246 100644
+--- a/common/httpclient/apple_transport_darwin.go
++++ b/common/httpclient/apple_transport_darwin.go
+@@ -175,6 +175,9 @@ func newAppleSessionConfig(ctx context.Context, options option.HTTPClientOptions
+ 	if len(tlsOptions.ALPN) > 0 {
+ 		return appleSessionConfig{}, E.New("tls.alpn is unsupported in Apple HTTP engine")
+ 	}
++	if len(tlsOptions.CertificateSHA256) > 0 {
++		return appleSessionConfig{}, E.New("tls.certificate_sha256 is unsupported in Apple HTTP engine")
++	}
+ 	validated, err := boxTLS.ValidateSystemTLSOptions(ctx, tlsOptions, "Apple HTTP engine")
+ 	if err != nil {
+ 		return appleSessionConfig{}, err
+diff --git a/common/tls/apple_client_platform.go b/common/tls/apple_client_platform.go
+index 1eb0ccf64751ad7b784c5fcb58ba49753217e627..3d25fd8147176d4f2ed989585f9d380137fa25e9 100644
+--- a/common/tls/apple_client_platform.go
++++ b/common/tls/apple_client_platform.go
+@@ -138,6 +138,14 @@ func (c *appleClientConfig) ClientHandshake(ctx context.Context, conn net.Conn)
+ 			return nil, err
+ 		}
+ 	}
++	if len(c.certificateSHA256) > 0 {
++		err = VerifyCertificateSHA256(c.certificateSHA256, rawCerts)
++		if err != nil {
++			C.box_apple_tls_client_cancel(client)
++			C.box_apple_tls_client_free(client)
++			return nil, err
++		}
++	}
+ 
+ 	return &appleTLSConn{
+ 		rawConn: conn,
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index af64ef6f29096770df63eee3b5fb13b43636ec18..f02f2970b3fcec2eb6d6e005a27e01f7d8f66e7e 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -56,6 +56,9 @@ func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+ }
+ 
+ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions, allowEmptyServerName bool) (Config, error) {
++	if len(options.CertificateSHA256) > 0 {
++		return nil, E.New("certificate_sha256 is unsupported in reality")
++	}
+ 	if options.UTLS == nil || !options.UTLS.Enabled {
+ 		return nil, E.New("uTLS is required by reality client")
+ 	}
+diff --git a/common/tls/std_client.go b/common/tls/std_client.go
+index 80fa6cb284f795572fe7649f5a9dd8008b958e08..235afc26567707d13bc4d4997891afcb1a169562 100644
+--- a/common/tls/std_client.go
++++ b/common/tls/std_client.go
+@@ -7,6 +7,7 @@ import (
+ 	"crypto/tls"
+ 	"crypto/x509"
+ 	"encoding/base64"
++	"encoding/hex"
+ 	"net"
+ 	"strings"
+ 	"time"
+@@ -134,7 +135,18 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
+ 	} else if options.DisableSNI {
+ 		tlsConfig.InsecureSkipVerify = true
+ 	}
+-	if len(options.CertificatePublicKeySHA256) > 0 {
++	if len(options.CertificateSHA256) > 0 {
++		if len(options.CertificatePublicKeySHA256) > 0 {
++			return nil, E.New("certificate_sha256 is conflict with certificate_public_key_sha256")
++		}
++		certificateSHA256, err := ParseCertificateSHA256(options.CertificateSHA256)
++		if err != nil {
++			return nil, err
++		}
++		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
++			return VerifyCertificateSHA256(certificateSHA256, rawCerts)
++		}
++	} else if len(options.CertificatePublicKeySHA256) > 0 {
+ 		if len(options.Certificate) > 0 || options.CertificatePath != "" {
+ 			return nil, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
+ 		}
+@@ -276,6 +288,9 @@ func verifyConnection(rootCAs *x509.CertPool, timeFunc func() time.Time, serverN
+ }
+ 
+ func VerifyPublicKeySHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
++	if len(rawCerts) == 0 {
++		return E.New("missing remote certificate")
++	}
+ 	leafCertificate, err := x509.ParseCertificate(rawCerts[0])
+ 	if err != nil {
+ 		return E.Cause(err, "failed to parse leaf certificate")
+@@ -293,3 +308,29 @@ func VerifyPublicKeySHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
+ 	}
+ 	return E.New("unrecognized remote public key: ", base64.StdEncoding.EncodeToString(hashValue[:]))
+ }
++
++func ParseCertificateSHA256(values []string) ([][]byte, error) {
++	knownHashValues := make([][]byte, 0, len(values))
++	for _, value := range values {
++		normalized := strings.NewReplacer(":", "", "-", "").Replace(strings.TrimSpace(value))
++		hashValue, err := hex.DecodeString(normalized)
++		if err != nil || len(hashValue) != sha256.Size {
++			return nil, E.New("invalid certificate_sha256")
++		}
++		knownHashValues = append(knownHashValues, hashValue)
++	}
++	return knownHashValues, nil
++}
++
++func VerifyCertificateSHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
++	if len(rawCerts) == 0 {
++		return E.New("missing remote certificate")
++	}
++	hashValue := sha256.Sum256(rawCerts[0])
++	for _, value := range knownHashValues {
++		if bytes.Equal(value, hashValue[:]) {
++			return nil
++		}
++	}
++	return E.New("unrecognized remote certificate")
++}
+diff --git a/common/tls/system_client.go b/common/tls/system_client.go
+index 06f16352bd5a0f421c0f0828fe7e8531ce296faf..83c67f4fc97650b24e56a8c19d27150ac980e7db 100644
+--- a/common/tls/system_client.go
++++ b/common/tls/system_client.go
+@@ -14,11 +14,12 @@ import (
+ )
+ 
+ type SystemTLSValidated struct {
+-	MinVersion uint16
+-	MaxVersion uint16
+-	UserPEM    []byte
+-	Exclusive  bool
+-	Store      adapter.CertificateStore
++	MinVersion        uint16
++	MaxVersion        uint16
++	UserPEM           []byte
++	Exclusive         bool
++	Store             adapter.CertificateStore
++	CertificateSHA256 [][]byte
+ }
+ 
+ func ValidateSystemTLSOptions(ctx context.Context, options option.OutboundTLSOptions, engineName string) (SystemTLSValidated, error) {
+@@ -52,9 +53,16 @@ func ValidateSystemTLSOptions(ctx context.Context, options option.OutboundTLSOpt
+ 	if options.Spoof != "" || options.SpoofMethod != "" {
+ 		return SystemTLSValidated{}, E.New("spoof is unsupported in ", engineName)
+ 	}
++	if len(options.CertificateSHA256) > 0 && len(options.CertificatePublicKeySHA256) > 0 {
++		return SystemTLSValidated{}, E.New("certificate_sha256 is conflict with certificate_public_key_sha256")
++	}
+ 	if len(options.CertificatePublicKeySHA256) > 0 && (len(options.Certificate) > 0 || options.CertificatePath != "") {
+ 		return SystemTLSValidated{}, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
+ 	}
++	certificateSHA256, err := ParseCertificateSHA256(options.CertificateSHA256)
++	if err != nil {
++		return SystemTLSValidated{}, err
++	}
+ 	var minVersion uint16
+ 	if options.MinVersion != "" {
+ 		parsed, err := ParseTLSVersion(options.MinVersion)
+@@ -76,11 +84,12 @@ func ValidateSystemTLSOptions(ctx context.Context, options option.OutboundTLSOpt
+ 		return SystemTLSValidated{}, err
+ 	}
+ 	return SystemTLSValidated{
+-		MinVersion: minVersion,
+-		MaxVersion: maxVersion,
+-		UserPEM:    userPEM,
+-		Exclusive:  exclusive,
+-		Store:      store,
++		MinVersion:        minVersion,
++		MaxVersion:        maxVersion,
++		UserPEM:           userPEM,
++		Exclusive:         exclusive,
++		Store:             store,
++		CertificateSHA256: certificateSHA256,
+ 	}, nil
+ }
+ 
+diff --git a/common/tls/system_client_engine.go b/common/tls/system_client_engine.go
+index 5fc89959fcef77d7e608092fffa3a4ba22bb3923..f8a3433420d5d9d868d3e11f3c06e5e71f92a0b5 100644
+--- a/common/tls/system_client_engine.go
++++ b/common/tls/system_client_engine.go
+@@ -23,6 +23,7 @@ type systemTLSConfig struct {
+ 	maxVersion                 uint16
+ 	insecure                   bool
+ 	anchorOnly                 bool
++	certificateSHA256          [][]byte
+ 	certificatePublicKeySHA256 [][]byte
+ 	timeFunc                   func() time.Time
+ 	store                      adapter.CertificateStore
+@@ -69,6 +70,7 @@ func (c *systemTLSConfig) clone() systemTLSConfig {
+ 		maxVersion:                 c.maxVersion,
+ 		insecure:                   c.insecure,
+ 		anchorOnly:                 c.anchorOnly,
++		certificateSHA256:          append([][]byte(nil), c.certificateSHA256...),
+ 		certificatePublicKeySHA256: append([][]byte(nil), c.certificatePublicKeySHA256...),
+ 		timeFunc:                   c.timeFunc,
+ 		store:                      c.store,
+@@ -101,6 +103,7 @@ func newSystemTLSConfig(ctx context.Context, serverAddress string, options optio
+ 		maxVersion:                 validated.MaxVersion,
+ 		insecure:                   options.Insecure || len(options.CertificatePublicKeySHA256) > 0,
+ 		anchorOnly:                 validated.Exclusive,
++		certificateSHA256:          append([][]byte(nil), validated.CertificateSHA256...),
+ 		certificatePublicKeySHA256: append([][]byte(nil), options.CertificatePublicKeySHA256...),
+ 		timeFunc:                   ntp.TimeFuncFromContext(ctx),
+ 		store:                      validated.Store,
+diff --git a/common/tls/utls_client.go b/common/tls/utls_client.go
+index 16d0352d08a52df6ba3021f3fa83656c285edeb7..4d5726928fdf9ffdeed2ae36aca0cfb36f5b172e 100644
+--- a/common/tls/utls_client.go
++++ b/common/tls/utls_client.go
+@@ -209,7 +209,18 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
+ 			return nil, E.New("disable_sni is unsupported in reality")
+ 		}
+ 	}
+-	if len(options.CertificatePublicKeySHA256) > 0 {
++	if len(options.CertificateSHA256) > 0 {
++		if len(options.CertificatePublicKeySHA256) > 0 {
++			return nil, E.New("certificate_sha256 is conflict with certificate_public_key_sha256")
++		}
++		certificateSHA256, err := ParseCertificateSHA256(options.CertificateSHA256)
++		if err != nil {
++			return nil, err
++		}
++		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
++			return VerifyCertificateSHA256(certificateSHA256, rawCerts)
++		}
++	} else if len(options.CertificatePublicKeySHA256) > 0 {
+ 		if len(options.Certificate) > 0 || options.CertificatePath != "" {
+ 			return nil, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
+ 		}
+diff --git a/common/tls/windows_client.go b/common/tls/windows_client.go
+index 9a865c0aa1bd2556176ecdb9968c33c68544e345..189de978c94f7ba2b7ae84a7a8fe8bc66c255821 100644
+--- a/common/tls/windows_client.go
++++ b/common/tls/windows_client.go
+@@ -108,6 +108,12 @@ func (c *windowsClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 			return nil, err
+ 		}
+ 	}
++	if len(c.certificateSHA256) > 0 {
++		err = VerifyCertificateSHA256(c.certificateSHA256, rawCerts)
++		if err != nil {
++			return nil, err
++		}
++	}
+ 	header, trailer, maxMessage, err := client.StreamSizes()
+ 	if err != nil {
+ 		return nil, err
+diff --git a/option/tls.go b/option/tls.go
+index 5c807d6763354cd7bf4f3ecb33ebb021aad31e07..5bc81ee28caccd8a08e9eadf4f820e55460563d3 100644
+--- a/option/tls.go
++++ b/option/tls.go
+@@ -117,6 +117,7 @@ type OutboundTLSOptions struct {
+ 	CurvePreferences           badoption.Listable[CurvePreference] `json:"curve_preferences,omitempty"`
+ 	Certificate                badoption.Listable[string]          `json:"certificate,omitempty"`
+ 	CertificatePath            string                              `json:"certificate_path,omitempty"`
++	CertificateSHA256          badoption.Listable[string]          `json:"certificate_sha256,omitempty"`
+ 	CertificatePublicKeySHA256 badoption.Listable[[]byte]          `json:"certificate_public_key_sha256,omitempty"`
+ 	ClientCertificate          badoption.Listable[string]          `json:"client_certificate,omitempty"`
+ 	ClientCertificatePath      string                              `json:"client_certificate_path,omitempty"`
