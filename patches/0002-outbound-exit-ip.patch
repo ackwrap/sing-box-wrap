@@ -9,10 +9,10 @@ index 0000000000000000000000000000000000000000..1bc53ebea7f7eafb17a077e7bf9fea03
 +* Add a loopback-only Clash API endpoint at `GET /proxies/{name}/exit-ip?ip_version=4|6` for Ackwrap. The endpoint reuses configured Clash API authentication, requests a fixed Cloudflare Trace address directly through the named outbound, and does not change selector state.
 diff --git a/experimental/clashapi/exitip.go b/experimental/clashapi/exitip.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..6d2cce950f7fe928c1cd8b4855e19c22926f2fcc
+index 0000000000000000000000000000000000000000..55fcc5190c81a60173b6846d0239ce2e4325b402
 --- /dev/null
 +++ b/experimental/clashapi/exitip.go
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,270 @@
 +package clashapi
 +
 +import (
@@ -71,10 +71,17 @@ index 0000000000000000000000000000000000000000..6d2cce950f7fe928c1cd8b4855e19c22
 +		server.logger.Info("outbound exit IP check started: ", proxy.Tag())
 +		ip, err := lookupOutboundExitIP(ctx, proxy, ipv6)
 +		if err != nil {
-+			stage, message, status := describeOutboundExitIPError(ctx, err)
-+			server.logger.Warn("outbound exit IP check failed stage=", stage, ": ", proxy.Tag())
-+			render.Status(request, status)
-+			render.JSON(writer, request, render.M{"message": message, "stage": stage})
++			description := describeOutboundExitIPError(ctx, err)
++			server.logger.Warn("outbound exit IP check failed stage=", description.stage, " reason=", description.reason, ": ", proxy.Tag())
++			payload := render.M{
++				"stage":  description.stage,
++				"reason": description.reason,
++			}
++			if description.upstreamStatus > 0 {
++				payload["upstream_status"] = description.upstreamStatus
++			}
++			render.Status(request, description.status)
++			render.JSON(writer, request, payload)
 +			return
 +		}
 +		server.logger.Info("outbound exit IP check completed: ", proxy.Tag())
@@ -86,8 +93,9 @@ index 0000000000000000000000000000000000000000..6d2cce950f7fe928c1cd8b4855e19c22
 +}
 +
 +type outboundExitIPStageError struct {
-+	stage string
-+	err   error
++	stage          string
++	upstreamStatus int
++	err            error
 +}
 +
 +func (e *outboundExitIPStageError) Error() string {
@@ -102,9 +110,18 @@ index 0000000000000000000000000000000000000000..6d2cce950f7fe928c1cd8b4855e19c22
 +	return &outboundExitIPStageError{stage: stage, err: err}
 +}
 +
-+func describeOutboundExitIPError(ctx context.Context, err error) (string, string, int) {
++type outboundExitIPErrorDescription struct {
++	stage          string
++	reason         string
++	status         int
++	upstreamStatus int
++}
++
++func describeOutboundExitIPError(ctx context.Context, err error) outboundExitIPErrorDescription {
 +	if isOutboundExitIPTimeout(ctx, err) {
-+		return "timeout", "Exit IP lookup timed out", http.StatusGatewayTimeout
++		return outboundExitIPErrorDescription{
++			stage: "timeout", reason: "timeout", status: http.StatusGatewayTimeout,
++		}
 +	}
 +	stage := "outbound_connect"
 +	var stageError *outboundExitIPStageError
@@ -113,20 +130,67 @@ index 0000000000000000000000000000000000000000..6d2cce950f7fe928c1cd8b4855e19c22
 +	}
 +	switch stage {
 +	case "http_status":
-+		if stageError != nil {
-+			return stage, stageError.err.Error(), http.StatusBadGateway
++		description := outboundExitIPErrorDescription{
++			stage: stage, reason: "upstream_http_status", status: http.StatusBadGateway,
 +		}
-+		return stage, "Exit IP service returned an unsuccessful HTTP status", http.StatusBadGateway
++		if stageError != nil {
++			description.upstreamStatus = stageError.upstreamStatus
++		}
++		return description
 +	case "read_response":
-+		return stage, "Unable to read the exit IP service response", http.StatusBadGateway
++		return outboundExitIPErrorDescription{
++			stage: stage, reason: "read_response", status: http.StatusBadGateway,
++		}
 +	case "response_too_large":
-+		return stage, "Exit IP service response exceeded the size limit", http.StatusBadGateway
++		return outboundExitIPErrorDescription{
++			stage: stage, reason: "response_too_large", status: http.StatusBadGateway,
++		}
 +	case "invalid_response":
-+		return stage, "Exit IP service returned an invalid response", http.StatusBadGateway
++		return outboundExitIPErrorDescription{
++			stage: stage, reason: "invalid_response", status: http.StatusBadGateway,
++		}
 +	case "address_family":
-+		return stage, "Exit IP service returned an unexpected address family", http.StatusBadGateway
++		return outboundExitIPErrorDescription{
++			stage: stage, reason: "address_family", status: http.StatusBadGateway,
++		}
 +	default:
-+		return "outbound_connect", "Outbound could not connect to the exit IP service", http.StatusBadGateway
++		return outboundExitIPErrorDescription{
++			stage: "outbound_connect", reason: classifyOutboundConnectError(err), status: http.StatusBadGateway,
++		}
++	}
++}
++
++func classifyOutboundConnectError(err error) string {
++	var dnsError *net.DNSError
++	if errors.As(err, &dnsError) {
++		return "dns_resolution"
++	}
++	var certificateError *tls.CertificateVerificationError
++	if errors.As(err, &certificateError) {
++		return "tls_certificate"
++	}
++	errorText := strings.ToLower(err.Error())
++	switch {
++	case strings.Contains(errorText, "no such host") || strings.Contains(errorText, "name resolution"):
++		return "dns_resolution"
++	case strings.Contains(errorText, "x509:") || strings.Contains(errorText, "certificate"):
++		return "tls_certificate"
++	case strings.Contains(errorText, "tls:") || strings.Contains(errorText, "tls handshake"):
++		return "tls_handshake"
++	case strings.Contains(errorText, "connection refused"):
++		return "connection_refused"
++	case strings.Contains(errorText, "network is unreachable") || strings.Contains(errorText, "no route to host"):
++		return "network_unreachable"
++	case strings.Contains(errorText, "connection reset"):
++		return "connection_reset"
++	case strings.Contains(errorText, "unexpected eof") || strings.Contains(errorText, "connection closed") || strings.Contains(errorText, "broken pipe"):
++		return "connection_closed"
++	case strings.Contains(errorText, "authentication failed") || strings.Contains(errorText, "unauthorized") || strings.Contains(errorText, "invalid password"):
++		return "outbound_authentication"
++	case strings.Contains(errorText, "handshake"):
++		return "protocol_handshake"
++	default:
++		return "connection_failed"
 +	}
 +}
 +
@@ -140,7 +204,7 @@ index 0000000000000000000000000000000000000000..6d2cce950f7fe928c1cd8b4855e19c22
 +}
 +
 +func isOutboundExitIPTimeout(ctx context.Context, err error) bool {
-+	if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
++	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
 +		return true
 +	}
 +	var networkError net.Error
@@ -187,7 +251,9 @@ index 0000000000000000000000000000000000000000..6d2cce950f7fe928c1cd8b4855e19c22
 +	}
 +	defer response.Body.Close()
 +	if response.StatusCode != http.StatusOK {
-+		return nil, wrapOutboundExitIPError("http_status", fmt.Errorf("exit IP service returned HTTP %d", response.StatusCode))
++		return nil, &outboundExitIPStageError{
++			stage: "http_status", upstreamStatus: response.StatusCode, err: fmt.Errorf("exit IP service returned HTTP %d", response.StatusCode),
++		}
 +	}
 +	body, err := io.ReadAll(io.LimitReader(response.Body, outboundExitIPBodyLimit+1))
 +	if err != nil {
