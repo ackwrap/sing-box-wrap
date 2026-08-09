@@ -1,31 +1,30 @@
-# sing-box
+# sing-box-wrap
 
-The universal proxy platform.
+Ackwrap maintains its sing-box core as a reproducible patch stack instead of a
+source fork with merged upstream history.
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/sing-box.svg)](https://repology.org/project/sing-box/versions)
+The `sing-box/` submodule points to an exact official SagerNet/sing-box commit.
+Ackwrap production changes live in `patches/` and are applied in the order
+listed by `patches/series`.
 
-## Documentation
+Prepare a disposable patched checkout:
 
-https://sing-box.sagernet.org
-
-## License
-
+```bash
+python scripts/prepare_core.py
 ```
-Copyright (C) 2022 by nekohasekai <contact-sagernet@sekai.icu>
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+Build the prepared core:
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program. If not, see <http://www.gnu.org/licenses/>.
-
-In addition, no derivative work may use the name or imply association
-with this application without prior consent.
+```bash
+cd .work/sing-box
+make build
+go build ./...
 ```
+
+Do not edit the official submodule directly. Update its gitlink and
+`patches/upstream.txt` together, then verify that every patch still applies and
+the prepared source builds before accepting an upstream update.
+
+The initial patch stack intentionally contains production code only. Ackwrap
+test additions will be migrated separately after the production stack is
+stable.

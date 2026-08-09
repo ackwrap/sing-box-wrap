@@ -1,0 +1,2733 @@
+diff --git a/change/ssr.md b/change/ssr.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f64270caf849e8da09391d54491cbfa41ef06c10
+--- /dev/null
++++ b/change/ssr.md
+@@ -0,0 +1,52 @@
++# ShadowsocksR Outbound Maintenance Record
++
++## Scope
++
++Ackwrap's sing-box fork restores ShadowsocksR as an outbound only. The removed ShadowsocksR inbound remains a compatibility stub.
++
++## Implementation
++
++- Registry type: `shadowsocksr`
++- Protocol/obfs baseline: upstream sing-box 1.5.5 `transport/clashssr`, copied into this fork and adapted to fork-internal pool, tools, KDF, and cipher packages
++- Cipher implementation: fork-maintained `transport/clashssr/shadowstream`, using the Go standard library and the existing `golang.org/x/crypto/chacha20`
++- Supported networks: TCP and native SSR UDP packet transport
++- No Mihomo, Clash, or third-party SSR runtime package is imported
++- HTTP and TLS obfs handshake responses support normal TCP segmentation
++- TLS handshake state and auth-chain UDP PRNG state are serialized; malformed UDP padding is rejected before slicing
++
++## Supported Protocols
++
++- `origin`
++- `auth_sha1_v4`
++- `auth_aes128_md5`
++- `auth_aes128_sha1`
++- `auth_chain_a`
++- `auth_chain_b`
++
++## Supported Obfuscation
++
++- `plain`
++- `http_simple`
++- `http_post`
++- `random_head`
++- `tls1.2_ticket_auth`
++- `tls1.2_ticket_fastauth`
++
++## Supported Ciphers
++
++AES-128/192/256 CFB, CTR and OFB, RC4-MD5, RC4-MD5-6, ChaCha20-IETF, and `none`/`dummy`. Unsupported classic or AEAD methods are rejected during outbound construction.
++
++## Ackwrap Mapping
++
++Ackwrap keeps `ssr` as the database/UI name and maps it to `shadowsocksr`; `cipher` becomes `method`, hyphenated protocol/obfs parameters become underscore fields, and Clash `udp: false` becomes `network: tcp`.
++
++## Branch Safety
++
++`devel` is the merge boundary between upstream synchronization and Ackwrap changes. Commit and push core changes before the parent repository updates its submodule pointer. Never move a dirty submodule worktree during merge, pull, rebase, checkout, or submodule update.
++
++## Verification
++
++```bash
++go test ./transport/clashssr/... ./protocol/shadowsocksr ./include
++go build ./cmd/sing-box
++```
+diff --git a/include/registry.go b/include/registry.go
+index 9bb9220c183cd0f2f59762d7b0dc5320e2dd8cca..782904e99928156878a6bae65ada28ab5727c101 100644
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -29,6 +29,7 @@ import (
+ 	"github.com/sagernet/sing-box/protocol/naive"
+ 	"github.com/sagernet/sing-box/protocol/redirect"
+ 	"github.com/sagernet/sing-box/protocol/shadowsocks"
++	"github.com/sagernet/sing-box/protocol/shadowsocksr"
+ 	"github.com/sagernet/sing-box/protocol/shadowtls"
+ 	"github.com/sagernet/sing-box/protocol/snell"
+ 	"github.com/sagernet/sing-box/protocol/socks"
+@@ -91,6 +92,7 @@ func OutboundRegistry() *outbound.Registry {
+ 	socks.RegisterOutbound(registry)
+ 	http.RegisterOutbound(registry)
+ 	shadowsocks.RegisterOutbound(registry)
++	shadowsocksr.RegisterOutbound(registry)
+ 	snell.RegisterOutbound(registry)
+ 	vmess.RegisterOutbound(registry)
+ 	trojan.RegisterOutbound(registry)
+@@ -174,9 +176,6 @@ func registerStubForRemovedInbounds(registry *inbound.Registry) {
+ }
+ 
+ func registerStubForRemovedOutbounds(registry *outbound.Registry) {
+-	outbound.Register[option.ShadowsocksROutboundOptions](registry, C.TypeShadowsocksR, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowsocksROutboundOptions) (adapter.Outbound, error) {
+-		return nil, E.New("ShadowsocksR is deprecated and removed in sing-box 1.6.0")
+-	})
+ 	outbound.Register[option.StubOptions](registry, C.TypeWireGuard, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Outbound, error) {
+ 		return nil, E.New("WireGuard outbound is deprecated in sing-box 1.11.0 and removed in sing-box 1.13.0, use WireGuard endpoint instead")
+ 	})
+diff --git a/protocol/shadowsocksr/outbound.go b/protocol/shadowsocksr/outbound.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..640a28b7f3e8aa34a83c8288b8d8a1f466a3d73e
+--- /dev/null
++++ b/protocol/shadowsocksr/outbound.go
+@@ -0,0 +1,142 @@
++package shadowsocksr
++
++import (
++	"bytes"
++	"context"
++	"net"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/common/dialer"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/transport/clashssr/obfs"
++	"github.com/sagernet/sing-box/transport/clashssr/protocol"
++	"github.com/sagernet/sing-box/transport/clashssr/shadowstream"
++	"github.com/sagernet/sing/common/bufio"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++func RegisterOutbound(registry *outbound.Registry) {
++	outbound.Register[option.ShadowsocksROutboundOptions](registry, C.TypeShadowsocksR, NewOutbound)
++}
++
++type Outbound struct {
++	outbound.Adapter
++	logger     logger.ContextLogger
++	dialer     N.Dialer
++	serverAddr M.Socksaddr
++	cipher     *shadowstream.Cipher
++	obfs       obfs.Obfs
++	protocol   protocol.Protocol
++}
++
++func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowsocksROutboundOptions) (adapter.Outbound, error) {
++	cipher, err := shadowstream.New(options.Method, options.Password)
++	if err != nil {
++		return nil, E.Cause(err, "initialize ShadowsocksR cipher")
++	}
++	obfuscation, obfsOverhead, err := obfs.PickObfs(options.Obfs, &obfs.Base{Host: options.Server, Port: int(options.ServerPort), Key: cipher.Key(), IVSize: cipher.IVSize(), Param: options.ObfsParam})
++	if err != nil {
++		return nil, E.Cause(err, "initialize ShadowsocksR obfs")
++	}
++	protocolCodec, err := protocol.PickProtocol(options.Protocol, &protocol.Base{Key: cipher.Key(), Overhead: obfsOverhead, Param: options.ProtocolParam})
++	if err != nil {
++		return nil, E.Cause(err, "initialize ShadowsocksR protocol")
++	}
++	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
++	if err != nil {
++		return nil, err
++	}
++	return &Outbound{
++		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeShadowsocksR, tag, options.Network.Build(), options.DialerOptions), logger: logger, dialer: outboundDialer,
++		serverAddr: options.ServerOptions.Build(), cipher: cipher, obfs: obfuscation, protocol: protocolCodec,
++	}, nil
++}
++
++func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	ctx, metadata := adapter.ExtendContext(ctx)
++	metadata.Outbound, metadata.Destination = h.Tag(), destination
++	switch N.NetworkName(network) {
++	case N.NetworkTCP:
++		h.logger.InfoContext(ctx, "outbound connection to ", destination)
++		conn, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
++		if err != nil {
++			return nil, err
++		}
++		conn = h.obfs.StreamConn(conn)
++		streamConn := h.cipher.StreamConn(conn)
++		writeIV, err := streamConn.ObtainWriteIV()
++		if err != nil {
++			conn.Close()
++			return nil, err
++		}
++		conn = h.protocol.StreamConn(streamConn, writeIV)
++		if err = M.SocksaddrSerializer.WriteAddrPort(conn, destination); err != nil {
++			conn.Close()
++			return nil, E.Cause(err, "write ShadowsocksR request")
++		}
++		return conn, nil
++	case N.NetworkUDP:
++		packetConn, err := h.ListenPacket(ctx, destination)
++		if err != nil {
++			return nil, err
++		}
++		return bufio.NewBindPacketConn(packetConn, destination), nil
++	default:
++		return nil, E.Extend(N.ErrUnknownNetwork, network)
++	}
++}
++
++func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	ctx, metadata := adapter.ExtendContext(ctx)
++	metadata.Outbound, metadata.Destination = h.Tag(), destination
++	h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
++	conn, err := h.dialer.DialContext(ctx, N.NetworkUDP, h.serverAddr)
++	if err != nil {
++		return nil, err
++	}
++	packetConn := h.cipher.PacketConn(bufio.NewUnbindPacketConn(conn))
++	packetConn = h.protocol.PacketConn(packetConn)
++	return &ssrPacketConn{PacketConn: packetConn, serverAddr: conn.RemoteAddr()}, nil
++}
++
++type ssrPacketConn struct {
++	net.PacketConn
++	serverAddr net.Addr
++}
++
++func (c *ssrPacketConn) WriteTo(payload []byte, address net.Addr) (int, error) {
++	var packet bytes.Buffer
++	if err := M.SocksaddrSerializer.WriteAddrPort(&packet, M.SocksaddrFromNet(address)); err != nil {
++		return 0, err
++	}
++	packet.Write(payload)
++	if _, err := c.PacketConn.WriteTo(packet.Bytes(), c.serverAddr); err != nil {
++		return 0, err
++	}
++	return len(payload), nil
++}
++
++func (c *ssrPacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
++	packet := make([]byte, len(payload)+M.MaxSocksaddrLength)
++	n, _, err := c.PacketConn.ReadFrom(packet)
++	if err != nil {
++		return 0, nil, err
++	}
++	reader := bytes.NewReader(packet[:n])
++	destination, err := M.SocksaddrSerializer.ReadAddrPort(reader)
++	if err != nil {
++		return 0, nil, E.Cause(err, "parse ShadowsocksR UDP response address")
++	}
++	read := copy(payload, packet[n-reader.Len():n])
++	var address net.Addr = destination
++	if !destination.IsFqdn() {
++		address = destination.UDPAddr()
++	}
++	return read, address, nil
++}
+diff --git a/transport/clashssr/internal/pool/pool.go b/transport/clashssr/internal/pool/pool.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ed316ed732bb396b9f549b7daa585b3d89552cf
+--- /dev/null
++++ b/transport/clashssr/internal/pool/pool.go
+@@ -0,0 +1,20 @@
++package pool
++
++import (
++	"bytes"
++	"sync"
++)
++
++const RelayBufferSize = 20 * 1024
++
++var bufferPool = sync.Pool{New: func() any { return &bytes.Buffer{} }}
++
++func Get(size int) []byte { return make([]byte, size) }
++func Put([]byte) error    { return nil }
++
++func GetBuffer() *bytes.Buffer { return bufferPool.Get().(*bytes.Buffer) }
++
++func PutBuffer(buffer *bytes.Buffer) {
++	buffer.Reset()
++	bufferPool.Put(buffer)
++}
+diff --git a/transport/clashssr/internal/tools/crypto.go b/transport/clashssr/internal/tools/crypto.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..64fec40709d8374151e5aa776faf33afc0c6ce48
+--- /dev/null
++++ b/transport/clashssr/internal/tools/crypto.go
+@@ -0,0 +1,80 @@
++package tools
++
++import (
++	"bytes"
++	"crypto/hmac"
++	"crypto/md5"
++	"crypto/rand"
++	"crypto/sha1"
++	"encoding/binary"
++	"io"
++)
++
++const HmacSHA1Len = 10
++
++func HmacMD5(key, data []byte) []byte {
++	hash := hmac.New(md5.New, key)
++	hash.Write(data)
++	return hash.Sum(nil)
++}
++
++func HmacSHA1(key, data []byte) []byte {
++	hash := hmac.New(sha1.New, key)
++	hash.Write(data)
++	return hash.Sum(nil)
++}
++
++func MD5Sum(data []byte) []byte {
++	sum := md5.Sum(data)
++	return sum[:]
++}
++
++func SHA1Sum(data []byte) []byte {
++	sum := sha1.Sum(data)
++	return sum[:]
++}
++
++func AppendRandBytes(buffer *bytes.Buffer, length int) {
++	_, _ = io.CopyN(buffer, rand.Reader, int64(length))
++}
++
++func KDF(password string, keyLength int) []byte {
++	var result, previous []byte
++	for len(result) < keyLength {
++		hash := md5.New()
++		hash.Write(previous)
++		hash.Write([]byte(password))
++		result = hash.Sum(result)
++		previous = result[len(result)-hash.Size():]
++	}
++	return result[:keyLength]
++}
++
++type XorShift128Plus struct{ state [2]uint64 }
++
++func (r *XorShift128Plus) Next() uint64 {
++	x, y := r.state[0], r.state[1]
++	r.state[0] = y
++	x ^= x << 23
++	x ^= y ^ (x >> 17) ^ (y >> 26)
++	r.state[1] = x
++	return x + y
++}
++
++func (r *XorShift128Plus) InitFromBin(data []byte) {
++	full := make([]byte, 16)
++	copy(full, data)
++	r.state[0] = binary.LittleEndian.Uint64(full[:8])
++	r.state[1] = binary.LittleEndian.Uint64(full[8:])
++}
++
++func (r *XorShift128Plus) InitFromBinAndLength(data []byte, length int) {
++	full := make([]byte, 16)
++	copy(full, data)
++	binary.LittleEndian.PutUint16(full, uint16(length))
++	r.state[0] = binary.LittleEndian.Uint64(full[:8])
++	r.state[1] = binary.LittleEndian.Uint64(full[8:])
++	for range 4 {
++		r.Next()
++	}
++}
+diff --git a/transport/clashssr/obfs/base.go b/transport/clashssr/obfs/base.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7fd1b84cf7912dbef75330b4819e75569f353376
+--- /dev/null
++++ b/transport/clashssr/obfs/base.go
+@@ -0,0 +1,9 @@
++package obfs
++
++type Base struct {
++	Host   string
++	Port   int
++	Key    []byte
++	IVSize int
++	Param  string
++}
+diff --git a/transport/clashssr/obfs/http_post.go b/transport/clashssr/obfs/http_post.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..4be6cbe8b1cff52435818cdcf739b2fd3f031341
+--- /dev/null
++++ b/transport/clashssr/obfs/http_post.go
+@@ -0,0 +1,9 @@
++package obfs
++
++func init() {
++	register("http_post", newHTTPPost, 0)
++}
++
++func newHTTPPost(b *Base) Obfs {
++	return &httpObfs{Base: b, post: true}
++}
+diff --git a/transport/clashssr/obfs/http_simple.go b/transport/clashssr/obfs/http_simple.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5130997605b2b668314479d7ac61333f86011d1
+--- /dev/null
++++ b/transport/clashssr/obfs/http_simple.go
+@@ -0,0 +1,414 @@
++package obfs
++
++import (
++	"bytes"
++	"encoding/hex"
++	"errors"
++	"math/rand"
++	"net"
++	"strconv"
++	"strings"
++
++	"github.com/sagernet/sing-box/transport/clashssr/internal/pool"
++)
++
++func init() {
++	register("http_simple", newHTTPSimple, 0)
++}
++
++type httpObfs struct {
++	*Base
++	post bool
++}
++
++func newHTTPSimple(b *Base) Obfs {
++	return &httpObfs{Base: b}
++}
++
++type httpConn struct {
++	net.Conn
++	*httpObfs
++	hasSentHeader bool
++	hasRecvHeader bool
++	buf           []byte
++	headerBuf     bytes.Buffer
++}
++
++func (h *httpObfs) StreamConn(c net.Conn) net.Conn {
++	return &httpConn{Conn: c, httpObfs: h}
++}
++
++func (c *httpConn) Read(b []byte) (int, error) {
++	if c.buf != nil {
++		n := copy(b, c.buf)
++		if n == len(c.buf) {
++			c.buf = nil
++		} else {
++			c.buf = c.buf[n:]
++		}
++		return n, nil
++	}
++
++	if c.hasRecvHeader {
++		return c.Conn.Read(b)
++	}
++
++	for {
++		buf := pool.Get(pool.RelayBufferSize)
++		n, err := c.Conn.Read(buf)
++		if n > 0 {
++			c.headerBuf.Write(buf[:n])
++		}
++		pool.Put(buf)
++		pos := bytes.Index(c.headerBuf.Bytes(), []byte("\r\n\r\n"))
++		if pos >= 0 {
++			c.hasRecvHeader = true
++			payload := c.headerBuf.Bytes()[pos+4:]
++			n = copy(b, payload)
++			if len(payload) > n {
++				c.buf = append(c.buf, payload[n:]...)
++			}
++			c.headerBuf.Reset()
++			return n, nil
++		}
++		if c.headerBuf.Len() > 64*1024 {
++			return 0, errors.New("http obfs response header is too large")
++		}
++		if err != nil {
++			return 0, err
++		}
++	}
++}
++
++func (c *httpConn) Write(b []byte) (int, error) {
++	if c.hasSentHeader {
++		return c.Conn.Write(b)
++	}
++	// 30: head length
++	headLength := c.IVSize + 30
++
++	bLength := len(b)
++	headDataLength := bLength
++	if bLength-headLength > 64 {
++		headDataLength = headLength + rand.Intn(65)
++	}
++	headData := b[:headDataLength]
++	b = b[headDataLength:]
++
++	var body string
++	host := c.Host
++	if len(c.Param) > 0 {
++		pos := strings.Index(c.Param, "#")
++		if pos != -1 {
++			body = strings.ReplaceAll(c.Param[pos+1:], "\n", "\r\n")
++			body = strings.ReplaceAll(body, "\\n", "\r\n")
++			host = c.Param[:pos]
++		} else {
++			host = c.Param
++		}
++	}
++	hosts := strings.Split(host, ",")
++	host = hosts[rand.Intn(len(hosts))]
++
++	buf := pool.GetBuffer()
++	defer pool.PutBuffer(buf)
++	if c.post {
++		buf.WriteString("POST /")
++	} else {
++		buf.WriteString("GET /")
++	}
++	packURLEncodedHeadData(buf, headData)
++	buf.WriteString(" HTTP/1.1\r\nHost: " + host)
++	if c.Port != 80 {
++		buf.WriteString(":" + strconv.Itoa(c.Port))
++	}
++	buf.WriteString("\r\n")
++	if len(body) > 0 {
++		buf.WriteString(body + "\r\n\r\n")
++	} else {
++		buf.WriteString("User-Agent: ")
++		buf.WriteString(userAgent[rand.Intn(len(userAgent))])
++		buf.WriteString("\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.8\r\nAccept-Encoding: gzip, deflate\r\n")
++		if c.post {
++			packBoundary(buf)
++		}
++		buf.WriteString("DNT: 1\r\nConnection: keep-alive\r\n\r\n")
++	}
++	buf.Write(b)
++	_, err := c.Conn.Write(buf.Bytes())
++	if err != nil {
++		return 0, err
++	}
++	c.hasSentHeader = true
++	return bLength, nil
++}
++
++func packURLEncodedHeadData(buf *bytes.Buffer, data []byte) {
++	dataLength := len(data)
++	for i := 0; i < dataLength; i++ {
++		buf.WriteRune('%')
++		buf.WriteString(hex.EncodeToString(data[i : i+1]))
++	}
++}
++
++func packBoundary(buf *bytes.Buffer) {
++	buf.WriteString("Content-Type: multipart/form-data; boundary=")
++	set := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
++	for i := 0; i < 32; i++ {
++		buf.WriteByte(set[rand.Intn(62)])
++	}
++	buf.WriteString("\r\n")
++}
++
++var userAgent = []string{
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.162 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.85 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.0; Moto C Build/NRD90M.059) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0.1; SM-G532M Build/MMB29T; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/55.0.2883.91 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.80 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2272.101 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.2; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/40.0.2214.111 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.94 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 5.1.1; SM-J120M Build/LMY47X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.80 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.0; Moto G (5) Build/NPPS25.137-93-14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.106 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.0; SM-G570M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.80 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 5.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.80 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.112 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0; CAM-L03 Build/HUAWEICAM-L03) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2272.76 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.117 Safari/537.36",
++	"Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US) AppleWebKit/534.3 (KHTML, like Gecko) Chrome/6.0.472.63 Safari/534.3",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/47.0.2526.106 Safari/537.36",
++	"Mozilla/5.0 (Windows; U; Windows NT 6.1; en-US) AppleWebKit/534.7 (KHTML, like Gecko) Chrome/7.0.517.44 Safari/534.7",
++	"Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/52.0.2743.116 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.75 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/54.0.2840.71 Safari/537.36",
++	"Mozilla/5.0 (Windows; U; Windows NT 6.1; en-US) AppleWebKit/534.3 (KHTML, like Gecko) Chrome/6.0.472.63 Safari/534.3",
++	"Mozilla/5.0 (Linux; Android 8.0.0; FIG-LX3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.80 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/40.0.2214.115 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/52.0.2743.116 Safari/537.36",
++	"Mozilla/5.0 (Windows; U; Windows NT 6.1; en-US) AppleWebKit/534.10 (KHTML, like Gecko) Chrome/8.0.552.237 Safari/534.10",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36",
++	"Mozilla/5.0 (X11; U; Linux x86_64; en-US) AppleWebKit/533.2 (KHTML, like Gecko) Chrome/5.0.342.1 Safari/533.2",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.110 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.89 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.81 Safari/537.36",
++	"Mozilla/5.0 (X11; Datanyze; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.132 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/54.0.2840.71 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 5.1.1; SM-J111M Build/LMY47V) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.106 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/37.0.2062.120 Safari/537.36",
++	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.84 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/54.0.2840.99 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/32.0.1700.107 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0.1; SM-J700M Build/MMB29K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.63 Safari/537.36",
++	"Mozilla/5.0 (X11; Linux i686) AppleWebKit/534.30 (KHTML, like Gecko) Slackware/Chrome/12.0.742.100 Safari/534.30",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.86 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/64.0.3282.167 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/48.0.2564.116 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.143 Safari/537.36",
++	"Mozilla/5.0 (X11; Linux i686) AppleWebKit/534.30 (KHTML, like Gecko) Chrome/12.0.742.100 Safari/534.30",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 8.0.0; WAS-LX3 Build/HUAWEIWAS-LX3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/54.0.2840.99 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/31.0.1650.57 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.99 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.101 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.1805 Safari/537.36 MVisionPlayer/1.0.0.0",
++	"Mozilla/5.0 (Linux; Android 7.0; TRT-LX3 Build/HUAWEITRT-LX3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2272.89 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0; vivo 1610 Build/MMB29M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.124 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.2; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/56.0.2924.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/47.0.2526.111 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 4.4.2; de-de; SAMSUNG GT-I9195 Build/KOT49H) AppleWebKit/537.36 (KHTML, like Gecko) Version/1.5 Chrome/28.0.1500.94 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.110 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/39.0.2171.95 Safari/537.36",
++	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.90 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.110 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 8.0.0; ANE-LX3 Build/HUAWEIANE-LX3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.112 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/56.0.2924.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.143 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/56.0.2924.87 Safari/537.36",
++	"Mozilla/5.0 (X11; U; Linux i586; en-US) AppleWebKit/533.2 (KHTML, like Gecko) Chrome/5.0.342.1 Safari/533.2",
++	"Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/43.0.2357.65 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.0; SM-G610M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.80 Mobile Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0.1; SM-J500M Build/MMB29M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US) AppleWebKit/534.7 (KHTML, like Gecko) Chrome/7.0.517.44 Safari/534.7",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2272.104 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/59.0.3071.115 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/56.0.2924.87 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0; vivo 1606 Build/MMB29M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.124 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36",
++	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.0; SM-G610M Build/NRD90M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.1; vivo 1716 Build/N2G47H) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.98 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/56.0.2924.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.93 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.0; SM-G570M Build/NRD90M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0; MYA-L22 Build/HUAWEIMYA-L22) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.84 Mobile Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 5.1; A1601 Build/LMY47I) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/52.0.2743.98 Mobile Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.0; TRT-LX2 Build/HUAWEITRT-LX2; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/59.0.3071.125 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.2; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 5.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36",
++	"Mozilla/5.0 (Windows; U; Windows NT 6.1; en-US) AppleWebKit/534.17 (KHTML, like Gecko) Chrome/10.0.649.0 Safari/534.17",
++	"Mozilla/5.0 (Linux; Android 6.0; CAM-L21 Build/HUAWEICAM-L21; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/62.0.3202.84 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.94 Safari/537.36",
++	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/534.24 (KHTML, like Gecko) Chrome/11.0.696.3 Safari/534.24",
++	"Mozilla/5.0 (Linux; Android 7.1.2; Redmi 4X Build/N2G47H) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.111 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.106 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.181 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 4.4.2; SM-G7102 Build/KOT49H) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.84 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/48.0.2564.109 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 5.1; HUAWEI CUN-L22 Build/HUAWEICUN-L22; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/62.0.3202.84 Mobile Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 5.1.1; A37fw Build/LMY47V) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.84 Mobile Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.0; SM-J730GM Build/NRD90M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.111 Mobile Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.0; SM-G610F Build/NRD90M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.111 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2272.101 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.1.2; Redmi Note 5A Build/N2G47H; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/63.0.3239.111 Mobile Safari/537.36",
++	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.77 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.0; Redmi Note 4 Build/NRD90M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.111 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/47.0.2526.106 Safari/537.36",
++	"Mozilla/5.0 (Unknown; Linux) AppleWebKit/538.1 (KHTML, like Gecko) Chrome/v1.0.0 Safari/538.1",
++	"Mozilla/5.0 (Linux; Android 7.0; BLL-L22 Build/HUAWEIBLL-L22) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.91 Mobile Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.0; SM-J710F Build/NRD90M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.84 Mobile Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0.1; SM-G532M Build/MMB29T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.91 Mobile Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.1.1; CPH1723 Build/N6F26Q) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.98 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2272.118 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.79 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.101 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.94 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.139 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 8.0.0; FIG-LX3 Build/HUAWEIFIG-LX3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows; U; Windows NT 6.1; de-DE) AppleWebKit/534.17 (KHTML, like Gecko) Chrome/10.0.649.0 Safari/534.17",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/52.0.2743.116 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.63 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.67 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.94 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.110 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.99 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/54.0.2840.99 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.67 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.67 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.77 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.67 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/43.0.2357.65 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 7.1; Mi A1 Build/N2G47H) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.83 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.117 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36",
++	"Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US) AppleWebKit/533.4 (KHTML, like Gecko) Chrome/5.0.375.99 Safari/533.4",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/36.0.1985.125 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.89 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/47.0.2526.111 Safari/537.36 MVisionPlayer/1.0.0.0",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 5.1; A37f Build/LMY47V) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/43.0.2357.93 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.132 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/56.0.2924.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.2; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.100 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.86 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.110 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2272.76 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 5.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.77 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.80 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0.1; CPH1607 Build/MMB29M; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/63.0.3239.111 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/54.0.2840.99 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/39.0.2171.95 Safari/537.36",
++	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.100 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0.1; vivo 1603 Build/MMB29M) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.83 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/64.0.3282.186 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0.1; SM-G532M Build/MMB29T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.87 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0.1; Redmi 4A Build/MMB29M; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/60.0.3112.116 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.112 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36",
++	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/44.0.2403.157 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 5.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.71 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 5.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.2; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.90 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.132 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.90 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.77 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.99 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.100 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.77 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.31 (KHTML, like Gecko) Chrome/26.0.1410.64 Safari/537.31",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.84 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/64.0.3282.186 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/59.0.3071.115 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.80 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/36.0.1985.143 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 5.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.112 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.67 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/65.0.3325.181 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.181 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.99 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/52.0.2743.116 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.106 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.3; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0.1; SM-G532G Build/MMB29T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.83 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/48.0.2564.109 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.117 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.139 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.67 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/34.0.1847.131 Safari/537.36",
++	"Mozilla/5.0 (Linux; Android 6.0; vivo 1713 Build/MRA58K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.124 Mobile Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/62.0.3202.89 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.80 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2272.101 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.67 Safari/537.36",
++	"Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36",
++}
+diff --git a/transport/clashssr/obfs/obfs.go b/transport/clashssr/obfs/obfs.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..c56acc8adbf9b7f0e4c6b4879a0eae92daa34f51
+--- /dev/null
++++ b/transport/clashssr/obfs/obfs.go
+@@ -0,0 +1,42 @@
++package obfs
++
++import (
++	"errors"
++	"fmt"
++	"net"
++)
++
++var (
++	errTLS12TicketAuthIncorrectMagicNumber = errors.New("tls1.2_ticket_auth incorrect magic number")
++	errTLS12TicketAuthTooShortData         = errors.New("tls1.2_ticket_auth too short data")
++	errTLS12TicketAuthHMACError            = errors.New("tls1.2_ticket_auth hmac verifying failed")
++)
++
++type authData struct {
++	clientID [32]byte
++}
++
++type Obfs interface {
++	StreamConn(net.Conn) net.Conn
++}
++
++type obfsCreator func(b *Base) Obfs
++
++var obfsList = make(map[string]struct {
++	overhead int
++	new      obfsCreator
++})
++
++func register(name string, c obfsCreator, o int) {
++	obfsList[name] = struct {
++		overhead int
++		new      obfsCreator
++	}{overhead: o, new: c}
++}
++
++func PickObfs(name string, b *Base) (Obfs, int, error) {
++	if choice, ok := obfsList[name]; ok {
++		return choice.new(b), choice.overhead, nil
++	}
++	return nil, 0, fmt.Errorf("Obfs %s not supported", name)
++}
+diff --git a/transport/clashssr/obfs/plain.go b/transport/clashssr/obfs/plain.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb998a47b460053cf4ffc4b8fa8231e17ee31aa5
+--- /dev/null
++++ b/transport/clashssr/obfs/plain.go
+@@ -0,0 +1,15 @@
++package obfs
++
++import "net"
++
++type plain struct{}
++
++func init() {
++	register("plain", newPlain, 0)
++}
++
++func newPlain(b *Base) Obfs {
++	return &plain{}
++}
++
++func (p *plain) StreamConn(c net.Conn) net.Conn { return c }
+diff --git a/transport/clashssr/obfs/random_head.go b/transport/clashssr/obfs/random_head.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc35fc2317ed11e65c73031357eaaa540fbe088c
+--- /dev/null
++++ b/transport/clashssr/obfs/random_head.go
+@@ -0,0 +1,103 @@
++package obfs
++
++import (
++	"encoding/binary"
++	"hash/crc32"
++	"math/rand"
++	"net"
++	"sync"
++
++	"github.com/sagernet/sing-box/transport/clashssr/internal/pool"
++)
++
++func init() {
++	register("random_head", newRandomHead, 0)
++}
++
++type randomHead struct {
++	*Base
++}
++
++func newRandomHead(b *Base) Obfs {
++	return &randomHead{Base: b}
++}
++
++type randomHeadConn struct {
++	net.Conn
++	*randomHead
++	hasSentHeader bool
++	rawTransSent  bool
++	rawTransRecv  bool
++	buf           []byte
++	stateMutex    sync.Mutex
++}
++
++func (r *randomHead) StreamConn(c net.Conn) net.Conn {
++	return &randomHeadConn{Conn: c, randomHead: r}
++}
++
++func (c *randomHeadConn) Read(b []byte) (int, error) {
++	c.stateMutex.Lock()
++	if c.rawTransRecv {
++		c.stateMutex.Unlock()
++		return c.Conn.Read(b)
++	}
++	c.stateMutex.Unlock()
++	buf := pool.Get(pool.RelayBufferSize)
++	defer pool.Put(buf)
++	if _, err := c.Conn.Read(buf); err != nil {
++		return 0, err
++	}
++	c.stateMutex.Lock()
++	c.rawTransRecv = true
++	if len(c.buf) > 0 {
++		if err := writeAll(c.Conn, c.buf); err != nil {
++			c.stateMutex.Unlock()
++			return 0, err
++		}
++		c.buf = nil
++	}
++	c.rawTransSent = true
++	c.stateMutex.Unlock()
++	return c.Conn.Read(b)
++}
++
++func (c *randomHeadConn) Write(b []byte) (int, error) {
++	c.stateMutex.Lock()
++	defer c.stateMutex.Unlock()
++	if c.rawTransSent {
++		return c.Conn.Write(b)
++	}
++	c.buf = append(c.buf, b...)
++	if !c.hasSentHeader {
++		c.hasSentHeader = true
++		dataLength := rand.Intn(96) + 4
++		buf := pool.Get(dataLength + 4)
++		defer pool.Put(buf)
++		rand.Read(buf[:dataLength])
++		binary.LittleEndian.PutUint32(buf[dataLength:], 0xffffffff-crc32.ChecksumIEEE(buf[:dataLength]))
++		_, err := c.Conn.Write(buf)
++		return len(b), err
++	}
++	if c.rawTransRecv {
++		err := writeAll(c.Conn, c.buf)
++		c.buf = nil
++		c.rawTransSent = true
++		return len(b), err
++	}
++	return len(b), nil
++}
++
++func writeAll(conn net.Conn, data []byte) error {
++	for len(data) > 0 {
++		n, err := conn.Write(data)
++		if err != nil {
++			return err
++		}
++		if n == 0 {
++			return net.ErrClosed
++		}
++		data = data[n:]
++	}
++	return nil
++}
+diff --git a/transport/clashssr/obfs/tls1.2_ticket_auth.go b/transport/clashssr/obfs/tls1.2_ticket_auth.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..625ae8689f62d970b132a31e7c3df69f878c522a
+--- /dev/null
++++ b/transport/clashssr/obfs/tls1.2_ticket_auth.go
+@@ -0,0 +1,258 @@
++package obfs
++
++import (
++	"bytes"
++	"crypto/hmac"
++	"encoding/binary"
++	"math/rand"
++	"net"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/transport/clashssr/internal/pool"
++	"github.com/sagernet/sing-box/transport/clashssr/internal/tools"
++)
++
++func init() {
++	register("tls1.2_ticket_auth", newTLS12Ticket, 5)
++	register("tls1.2_ticket_fastauth", newTLS12Ticket, 5)
++}
++
++type tls12Ticket struct {
++	*Base
++	*authData
++}
++
++func newTLS12Ticket(b *Base) Obfs {
++	r := &tls12Ticket{Base: b, authData: &authData{}}
++	rand.Read(r.clientID[:])
++	return r
++}
++
++type tls12TicketConn struct {
++	net.Conn
++	*tls12Ticket
++	handshakeStatus int
++	decoded         bytes.Buffer
++	underDecoded    bytes.Buffer
++	sendBuf         bytes.Buffer
++	stateMutex      sync.Mutex
++}
++
++func (t *tls12Ticket) StreamConn(c net.Conn) net.Conn {
++	return &tls12TicketConn{Conn: c, tls12Ticket: t}
++}
++
++func (c *tls12TicketConn) Read(b []byte) (int, error) {
++	for {
++		if c.decoded.Len() > 0 {
++			return c.decoded.Read(b)
++		}
++		buf := pool.Get(pool.RelayBufferSize)
++		n, err := c.Conn.Read(buf)
++		if n > 0 {
++			c.underDecoded.Write(buf[:n])
++		}
++		pool.Put(buf)
++		if err != nil {
++			return 0, err
++		}
++		c.stateMutex.Lock()
++		handshakeComplete := c.handshakeStatus == 8
++		c.stateMutex.Unlock()
++		if !handshakeComplete {
++			if c.underDecoded.Len() < 5 {
++				continue
++			}
++			if !bytes.Equal(c.underDecoded.Bytes()[:3], []byte{0x16, 3, 3}) {
++				c.underDecoded.Reset()
++				return 0, errTLS12TicketAuthIncorrectMagicNumber
++			}
++			frameLength := 5 + int(binary.BigEndian.Uint16(c.underDecoded.Bytes()[3:5]))
++			if frameLength > 64*1024 {
++				c.underDecoded.Reset()
++				return 0, errTLS12TicketAuthTooShortData
++			}
++			if c.underDecoded.Len() < frameLength {
++				continue
++			}
++			frame := c.underDecoded.Next(frameLength)
++			if len(frame) < 11+32+1+32 {
++				return 0, errTLS12TicketAuthTooShortData
++			}
++			if !hmac.Equal(frame[33:43], c.hmacSHA1(frame[11:33])[:10]) || !hmac.Equal(frame[len(frame)-10:], c.hmacSHA1(frame[:len(frame)-10])[:10]) {
++				return 0, errTLS12TicketAuthHMACError
++			}
++			c.stateMutex.Lock()
++			_, err = c.writeLocked(nil)
++			c.stateMutex.Unlock()
++			if err != nil {
++				return 0, err
++			}
++		}
++		for c.underDecoded.Len() > 5 {
++			if !bytes.Equal(c.underDecoded.Bytes()[:3], []byte{0x17, 3, 3}) {
++				c.underDecoded.Reset()
++				return 0, errTLS12TicketAuthIncorrectMagicNumber
++			}
++			size := int(binary.BigEndian.Uint16(c.underDecoded.Bytes()[3:5]))
++			if c.underDecoded.Len() < 5+size {
++				break
++			}
++			c.underDecoded.Next(5)
++			c.decoded.Write(c.underDecoded.Next(size))
++		}
++		n, _ = c.decoded.Read(b)
++		if n > 0 {
++			return n, nil
++		}
++	}
++}
++
++func (c *tls12TicketConn) Write(b []byte) (int, error) {
++	c.stateMutex.Lock()
++	defer c.stateMutex.Unlock()
++	return c.writeLocked(b)
++}
++
++func (c *tls12TicketConn) writeLocked(b []byte) (int, error) {
++	length := len(b)
++	if c.handshakeStatus == 8 {
++		buf := pool.GetBuffer()
++		defer pool.PutBuffer(buf)
++		for len(b) > 2048 {
++			size := rand.Intn(4096) + 100
++			if len(b) < size {
++				size = len(b)
++			}
++			packData(buf, b[:size])
++			b = b[size:]
++		}
++		if len(b) > 0 {
++			packData(buf, b)
++		}
++		_, err := c.Conn.Write(buf.Bytes())
++		if err != nil {
++			return 0, err
++		}
++		return length, nil
++	}
++
++	if len(b) > 0 {
++		packData(&c.sendBuf, b)
++	}
++
++	if c.handshakeStatus == 0 {
++		c.handshakeStatus = 1
++
++		data := pool.GetBuffer()
++		defer pool.PutBuffer(data)
++
++		data.Write([]byte{3, 3})
++		c.packAuthData(data)
++		data.WriteByte(0x20)
++		data.Write(c.clientID[:])
++		data.Write([]byte{0x00, 0x1c, 0xc0, 0x2b, 0xc0, 0x2f, 0xcc, 0xa9, 0xcc, 0xa8, 0xcc, 0x14, 0xcc, 0x13, 0xc0, 0x0a, 0xc0, 0x14, 0xc0, 0x09, 0xc0, 0x13, 0x00, 0x9c, 0x00, 0x35, 0x00, 0x2f, 0x00, 0x0a})
++		data.Write([]byte{0x1, 0x0})
++
++		ext := pool.GetBuffer()
++		defer pool.PutBuffer(ext)
++
++		host := c.getHost()
++		ext.Write([]byte{0xff, 0x01, 0x00, 0x01, 0x00})
++		packSNIData(ext, host)
++		ext.Write([]byte{0, 0x17, 0, 0})
++		c.packTicketBuf(ext, host)
++		ext.Write([]byte{0x00, 0x0d, 0x00, 0x16, 0x00, 0x14, 0x06, 0x01, 0x06, 0x03, 0x05, 0x01, 0x05, 0x03, 0x04, 0x01, 0x04, 0x03, 0x03, 0x01, 0x03, 0x03, 0x02, 0x01, 0x02, 0x03})
++		ext.Write([]byte{0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00})
++		ext.Write([]byte{0x00, 0x12, 0x00, 0x00})
++		ext.Write([]byte{0x75, 0x50, 0x00, 0x00})
++		ext.Write([]byte{0x00, 0x0b, 0x00, 0x02, 0x01, 0x00})
++		ext.Write([]byte{0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x17, 0x00, 0x18})
++
++		binary.Write(data, binary.BigEndian, uint16(ext.Len()))
++		data.ReadFrom(ext)
++
++		ret := pool.GetBuffer()
++		defer pool.PutBuffer(ret)
++
++		ret.Write([]byte{0x16, 3, 1})
++		binary.Write(ret, binary.BigEndian, uint16(data.Len()+4))
++		ret.Write([]byte{1, 0})
++		binary.Write(ret, binary.BigEndian, uint16(data.Len()))
++		ret.ReadFrom(data)
++
++		_, err := c.Conn.Write(ret.Bytes())
++		if err != nil {
++			return 0, err
++		}
++		return length, nil
++	} else if c.handshakeStatus == 1 && len(b) == 0 {
++		buf := pool.GetBuffer()
++		defer pool.PutBuffer(buf)
++
++		buf.Write([]byte{0x14, 3, 3, 0, 1, 1, 0x16, 3, 3, 0, 0x20})
++		tools.AppendRandBytes(buf, 22)
++		buf.Write(c.hmacSHA1(buf.Bytes())[:10])
++		buf.ReadFrom(&c.sendBuf)
++
++		c.handshakeStatus = 8
++
++		_, err := c.Conn.Write(buf.Bytes())
++		return 0, err
++	}
++	return length, nil
++}
++
++func packData(buf *bytes.Buffer, data []byte) {
++	buf.Write([]byte{0x17, 3, 3})
++	binary.Write(buf, binary.BigEndian, uint16(len(data)))
++	buf.Write(data)
++}
++
++func (t *tls12Ticket) packAuthData(buf *bytes.Buffer) {
++	binary.Write(buf, binary.BigEndian, uint32(time.Now().Unix()))
++	tools.AppendRandBytes(buf, 18)
++	buf.Write(t.hmacSHA1(buf.Bytes()[buf.Len()-22:])[:10])
++}
++
++func packSNIData(buf *bytes.Buffer, u string) {
++	len := uint16(len(u))
++	buf.Write([]byte{0, 0})
++	binary.Write(buf, binary.BigEndian, len+5)
++	binary.Write(buf, binary.BigEndian, len+3)
++	buf.WriteByte(0)
++	binary.Write(buf, binary.BigEndian, len)
++	buf.WriteString(u)
++}
++
++func (c *tls12TicketConn) packTicketBuf(buf *bytes.Buffer, u string) {
++	length := 16 * (rand.Intn(17) + 8)
++	buf.Write([]byte{0, 0x23})
++	binary.Write(buf, binary.BigEndian, uint16(length))
++	tools.AppendRandBytes(buf, length)
++}
++
++func (t *tls12Ticket) hmacSHA1(data []byte) []byte {
++	key := pool.Get(len(t.Key) + 32)
++	defer pool.Put(key)
++	copy(key, t.Key)
++	copy(key[len(t.Key):], t.clientID[:])
++
++	sha1Data := tools.HmacSHA1(key, data)
++	return sha1Data[:10]
++}
++
++func (t *tls12Ticket) getHost() string {
++	host := t.Param
++	if len(host) == 0 {
++		host = t.Host
++	}
++	if len(host) > 0 && host[len(host)-1] >= '0' && host[len(host)-1] <= '9' {
++		host = ""
++	}
++	hosts := strings.Split(host, ",")
++	host = hosts[rand.Intn(len(hosts))]
++	return host
++}
+diff --git a/transport/clashssr/protocol/auth_aes128_md5.go b/transport/clashssr/protocol/auth_aes128_md5.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..aaee155bc5076cdd206c407e8cb663de817c104e
+--- /dev/null
++++ b/transport/clashssr/protocol/auth_aes128_md5.go
+@@ -0,0 +1,18 @@
++package protocol
++
++import "github.com/sagernet/sing-box/transport/clashssr/internal/tools"
++
++func init() {
++	register("auth_aes128_md5", newAuthAES128MD5, 9)
++}
++
++func newAuthAES128MD5(b *Base) Protocol {
++	a := &authAES128{
++		Base:               b,
++		authData:           &authData{},
++		authAES128Function: &authAES128Function{salt: "auth_aes128_md5", hmac: tools.HmacMD5, hashDigest: tools.MD5Sum},
++		userData:           &userData{},
++	}
++	a.initUserData()
++	return a
++}
+diff --git a/transport/clashssr/protocol/auth_aes128_sha1.go b/transport/clashssr/protocol/auth_aes128_sha1.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..788417df296d4760bb3eb987922293dd0cdd5278
+--- /dev/null
++++ b/transport/clashssr/protocol/auth_aes128_sha1.go
+@@ -0,0 +1,277 @@
++package protocol
++
++import (
++	"bytes"
++	"encoding/binary"
++	"math"
++	"math/rand"
++	"net"
++	"strconv"
++	"strings"
++
++	"github.com/sagernet/sing-box/transport/clashssr/internal/pool"
++	"github.com/sagernet/sing-box/transport/clashssr/internal/tools"
++)
++
++type (
++	hmacMethod       func(key, data []byte) []byte
++	hashDigestMethod func([]byte) []byte
++)
++
++func init() {
++	register("auth_aes128_sha1", newAuthAES128SHA1, 9)
++}
++
++type authAES128Function struct {
++	salt       string
++	hmac       hmacMethod
++	hashDigest hashDigestMethod
++}
++
++type authAES128 struct {
++	*Base
++	*authData
++	*authAES128Function
++	*userData
++	iv            []byte
++	hasSentHeader bool
++	rawTrans      bool
++	packID        uint32
++	recvID        uint32
++}
++
++func newAuthAES128SHA1(b *Base) Protocol {
++	a := &authAES128{
++		Base:               b,
++		authData:           &authData{},
++		authAES128Function: &authAES128Function{salt: "auth_aes128_sha1", hmac: tools.HmacSHA1, hashDigest: tools.SHA1Sum},
++		userData:           &userData{},
++	}
++	a.initUserData()
++	return a
++}
++
++func (a *authAES128) initUserData() {
++	params := strings.Split(a.Param, ":")
++	if len(params) > 1 {
++		if userID, err := strconv.ParseUint(params[0], 10, 32); err == nil {
++			binary.LittleEndian.PutUint32(a.userID[:], uint32(userID))
++			a.userKey = a.hashDigest([]byte(params[1]))
++		}
++	}
++	if len(a.userKey) == 0 {
++		a.userKey = a.Key
++		rand.Read(a.userID[:])
++	}
++}
++
++func (a *authAES128) StreamConn(c net.Conn, iv []byte) net.Conn {
++	p := &authAES128{
++		Base:               a.Base,
++		authData:           a.next(),
++		authAES128Function: a.authAES128Function,
++		userData:           a.userData,
++		packID:             1,
++		recvID:             1,
++	}
++	p.iv = iv
++	return &Conn{Conn: c, Protocol: p}
++}
++
++func (a *authAES128) PacketConn(c net.PacketConn) net.PacketConn {
++	p := &authAES128{
++		Base:               a.Base,
++		authAES128Function: a.authAES128Function,
++		userData:           a.userData,
++	}
++	return &PacketConn{PacketConn: c, Protocol: p}
++}
++
++func (a *authAES128) Decode(dst, src *bytes.Buffer) error {
++	if a.rawTrans {
++		dst.ReadFrom(src)
++		return nil
++	}
++	for src.Len() > 4 {
++		macKey := pool.Get(len(a.userKey) + 4)
++		defer pool.Put(macKey)
++		copy(macKey, a.userKey)
++		binary.LittleEndian.PutUint32(macKey[len(a.userKey):], a.recvID)
++		if !bytes.Equal(a.hmac(macKey, src.Bytes()[:2])[:2], src.Bytes()[2:4]) {
++			src.Reset()
++			return errAuthAES128MACError
++		}
++
++		length := int(binary.LittleEndian.Uint16(src.Bytes()[:2]))
++		if length >= 8192 || length < 7 {
++			a.rawTrans = true
++			src.Reset()
++			return errAuthAES128LengthError
++		}
++		if length > src.Len() {
++			break
++		}
++
++		if !bytes.Equal(a.hmac(macKey, src.Bytes()[:length-4])[:4], src.Bytes()[length-4:length]) {
++			a.rawTrans = true
++			src.Reset()
++			return errAuthAES128ChksumError
++		}
++
++		a.recvID++
++
++		pos := int(src.Bytes()[4])
++		if pos < 255 {
++			pos += 4
++		} else {
++			pos = int(binary.LittleEndian.Uint16(src.Bytes()[5:7])) + 4
++		}
++		dst.Write(src.Bytes()[pos : length-4])
++		src.Next(length)
++	}
++	return nil
++}
++
++func (a *authAES128) Encode(buf *bytes.Buffer, b []byte) error {
++	fullDataLength := len(b)
++	if !a.hasSentHeader {
++		dataLength := getDataLength(b)
++		a.packAuthData(buf, b[:dataLength])
++		b = b[dataLength:]
++		a.hasSentHeader = true
++	}
++	for len(b) > 8100 {
++		a.packData(buf, b[:8100], fullDataLength)
++		b = b[8100:]
++	}
++	if len(b) > 0 {
++		a.packData(buf, b, fullDataLength)
++	}
++	return nil
++}
++
++func (a *authAES128) DecodePacket(b []byte) ([]byte, error) {
++	if len(b) < 4 {
++		return nil, errAuthAES128LengthError
++	}
++	if !bytes.Equal(a.hmac(a.Key, b[:len(b)-4])[:4], b[len(b)-4:]) {
++		return nil, errAuthAES128ChksumError
++	}
++	return b[:len(b)-4], nil
++}
++
++func (a *authAES128) EncodePacket(buf *bytes.Buffer, b []byte) error {
++	buf.Write(b)
++	buf.Write(a.userID[:])
++	buf.Write(a.hmac(a.userKey, buf.Bytes())[:4])
++	return nil
++}
++
++func (a *authAES128) packData(poolBuf *bytes.Buffer, data []byte, fullDataLength int) {
++	dataLength := len(data)
++	randDataLength := a.getRandDataLengthForPackData(dataLength, fullDataLength)
++	/*
++		2:	uint16 LittleEndian packedDataLength
++		2:	hmac of packedDataLength
++		3:	maxRandDataLengthPrefix (min:1)
++		4:	hmac of packedData except the last 4 bytes
++	*/
++	packedDataLength := 2 + 2 + 3 + randDataLength + dataLength + 4
++	if randDataLength < 128 {
++		packedDataLength -= 2
++	}
++
++	macKey := pool.Get(len(a.userKey) + 4)
++	defer pool.Put(macKey)
++	copy(macKey, a.userKey)
++	binary.LittleEndian.PutUint32(macKey[len(a.userKey):], a.packID)
++	a.packID++
++
++	binary.Write(poolBuf, binary.LittleEndian, uint16(packedDataLength))
++	poolBuf.Write(a.hmac(macKey, poolBuf.Bytes()[poolBuf.Len()-2:])[:2])
++	a.packRandData(poolBuf, randDataLength)
++	poolBuf.Write(data)
++	poolBuf.Write(a.hmac(macKey, poolBuf.Bytes()[poolBuf.Len()-packedDataLength+4:])[:4])
++}
++
++func trapezoidRandom(max int, d float64) int {
++	base := rand.Float64()
++	if d-0 > 1e-6 {
++		a := 1 - d
++		base = (math.Sqrt(a*a+4*d*base) - a) / (2 * d)
++	}
++	return int(base * float64(max))
++}
++
++func (a *authAES128) getRandDataLengthForPackData(dataLength, fullDataLength int) int {
++	if fullDataLength >= 32*1024-a.Overhead {
++		return 0
++	}
++	// 1460: tcp_mss
++	revLength := 1460 - dataLength - 9
++	if revLength == 0 {
++		return 0
++	}
++	if revLength < 0 {
++		if revLength > -1460 {
++			return trapezoidRandom(revLength+1460, -0.3)
++		}
++		return rand.Intn(32)
++	}
++	if dataLength > 900 {
++		return rand.Intn(revLength)
++	}
++	return trapezoidRandom(revLength, -0.3)
++}
++
++func (a *authAES128) packAuthData(poolBuf *bytes.Buffer, data []byte) {
++	if len(data) == 0 {
++		return
++	}
++	dataLength := len(data)
++	randDataLength := a.getRandDataLengthForPackAuthData(dataLength)
++	/*
++		7:	checkHead(1) and hmac of checkHead(6)
++		4:	userID
++		16:	encrypted data of authdata(12), uint16 BigEndian packedDataLength(2) and uint16 BigEndian randDataLength(2)
++		4:	hmac of userID and encrypted data
++		4:	hmac of packedAuthData except the last 4 bytes
++	*/
++	packedAuthDataLength := 7 + 4 + 16 + 4 + randDataLength + dataLength + 4
++
++	macKey := pool.Get(len(a.iv) + len(a.Key))
++	defer pool.Put(macKey)
++	copy(macKey, a.iv)
++	copy(macKey[len(a.iv):], a.Key)
++
++	poolBuf.WriteByte(byte(rand.Intn(256)))
++	poolBuf.Write(a.hmac(macKey, poolBuf.Bytes())[:6])
++	poolBuf.Write(a.userID[:])
++	err := a.authData.putEncryptedData(poolBuf, a.userKey, [2]int{packedAuthDataLength, randDataLength}, a.salt)
++	if err != nil {
++		poolBuf.Reset()
++		return
++	}
++	poolBuf.Write(a.hmac(macKey, poolBuf.Bytes()[7:])[:4])
++	tools.AppendRandBytes(poolBuf, randDataLength)
++	poolBuf.Write(data)
++	poolBuf.Write(a.hmac(a.userKey, poolBuf.Bytes())[:4])
++}
++
++func (a *authAES128) getRandDataLengthForPackAuthData(size int) int {
++	if size > 400 {
++		return rand.Intn(512)
++	}
++	return rand.Intn(1024)
++}
++
++func (a *authAES128) packRandData(poolBuf *bytes.Buffer, size int) {
++	if size < 128 {
++		poolBuf.WriteByte(byte(size + 1))
++		tools.AppendRandBytes(poolBuf, size)
++		return
++	}
++	poolBuf.WriteByte(255)
++	binary.Write(poolBuf, binary.LittleEndian, uint16(size+3))
++	tools.AppendRandBytes(poolBuf, size)
++}
+diff --git a/transport/clashssr/protocol/auth_chain_a.go b/transport/clashssr/protocol/auth_chain_a.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f1b5dc6c920c5e515fee30e6a62711f843333fa
+--- /dev/null
++++ b/transport/clashssr/protocol/auth_chain_a.go
+@@ -0,0 +1,315 @@
++package protocol
++
++import (
++	"bytes"
++	"crypto/cipher"
++	"crypto/rand"
++	"crypto/rc4"
++	"encoding/base64"
++	"encoding/binary"
++	"net"
++	"strconv"
++	"strings"
++	"sync"
++
++	"github.com/sagernet/sing-box/transport/clashssr/internal/pool"
++	"github.com/sagernet/sing-box/transport/clashssr/internal/tools"
++)
++
++func init() {
++	register("auth_chain_a", newAuthChainA, 4)
++}
++
++type randDataLengthMethod func(int, []byte, *tools.XorShift128Plus) int
++
++type authChainA struct {
++	*Base
++	*authData
++	*userData
++	iv             []byte
++	salt           string
++	hasSentHeader  bool
++	rawTrans       bool
++	lastClientHash []byte
++	lastServerHash []byte
++	encrypter      cipher.Stream
++	decrypter      cipher.Stream
++	randomClient   tools.XorShift128Plus
++	randomServer   tools.XorShift128Plus
++	randDataLength randDataLengthMethod
++	packID         uint32
++	recvID         uint32
++	packetReadMu   sync.Mutex
++	packetWriteMu  sync.Mutex
++}
++
++func newAuthChainA(b *Base) Protocol {
++	a := &authChainA{
++		Base:     b,
++		authData: &authData{},
++		userData: &userData{},
++		salt:     "auth_chain_a",
++	}
++	a.initUserData()
++	return a
++}
++
++func (a *authChainA) initUserData() {
++	params := strings.Split(a.Param, ":")
++	if len(params) > 1 {
++		if userID, err := strconv.ParseUint(params[0], 10, 32); err == nil {
++			binary.LittleEndian.PutUint32(a.userID[:], uint32(userID))
++			a.userKey = []byte(params[1])
++		}
++	}
++	if len(a.userKey) == 0 {
++		a.userKey = a.Key
++		rand.Read(a.userID[:])
++	}
++}
++
++func (a *authChainA) StreamConn(c net.Conn, iv []byte) net.Conn {
++	p := &authChainA{
++		Base:     a.Base,
++		authData: a.next(),
++		userData: a.userData,
++		salt:     a.salt,
++		packID:   1,
++		recvID:   1,
++	}
++	p.iv = iv
++	p.randDataLength = p.getRandLength
++	return &Conn{Conn: c, Protocol: p}
++}
++
++func (a *authChainA) PacketConn(c net.PacketConn) net.PacketConn {
++	p := &authChainA{
++		Base:     a.Base,
++		salt:     a.salt,
++		userData: a.userData,
++	}
++	return &PacketConn{PacketConn: c, Protocol: p}
++}
++
++func (a *authChainA) Decode(dst, src *bytes.Buffer) error {
++	if a.rawTrans {
++		dst.ReadFrom(src)
++		return nil
++	}
++	for src.Len() > 4 {
++		macKey := pool.Get(len(a.userKey) + 4)
++		defer pool.Put(macKey)
++		copy(macKey, a.userKey)
++		binary.LittleEndian.PutUint32(macKey[len(a.userKey):], a.recvID)
++
++		dataLength := int(binary.LittleEndian.Uint16(src.Bytes()[:2]) ^ binary.LittleEndian.Uint16(a.lastServerHash[14:16]))
++		randDataLength := a.randDataLength(dataLength, a.lastServerHash, &a.randomServer)
++		length := dataLength + randDataLength
++
++		if length >= 4096 {
++			a.rawTrans = true
++			src.Reset()
++			return errAuthChainLengthError
++		}
++
++		if 4+length > src.Len() {
++			break
++		}
++
++		serverHash := tools.HmacMD5(macKey, src.Bytes()[:length+2])
++		if !bytes.Equal(serverHash[:2], src.Bytes()[length+2:length+4]) {
++			a.rawTrans = true
++			src.Reset()
++			return errAuthChainChksumError
++		}
++		a.lastServerHash = serverHash
++
++		pos := 2
++		if dataLength > 0 && randDataLength > 0 {
++			pos += getRandStartPos(randDataLength, &a.randomServer)
++		}
++		wantedData := src.Bytes()[pos : pos+dataLength]
++		a.decrypter.XORKeyStream(wantedData, wantedData)
++		if a.recvID == 1 {
++			dst.Write(wantedData[2:])
++		} else {
++			dst.Write(wantedData)
++		}
++		a.recvID++
++		src.Next(length + 4)
++	}
++	return nil
++}
++
++func (a *authChainA) Encode(buf *bytes.Buffer, b []byte) error {
++	if !a.hasSentHeader {
++		dataLength := getDataLength(b)
++		a.packAuthData(buf, b[:dataLength])
++		b = b[dataLength:]
++		a.hasSentHeader = true
++	}
++	for len(b) > 2800 {
++		a.packData(buf, b[:2800])
++		b = b[2800:]
++	}
++	if len(b) > 0 {
++		a.packData(buf, b)
++	}
++	return nil
++}
++
++func (a *authChainA) DecodePacket(b []byte) ([]byte, error) {
++	a.packetReadMu.Lock()
++	defer a.packetReadMu.Unlock()
++	if len(b) < 9 {
++		return nil, errAuthChainLengthError
++	}
++	if !bytes.Equal(tools.HmacMD5(a.userKey, b[:len(b)-1])[:1], b[len(b)-1:]) {
++		return nil, errAuthChainChksumError
++	}
++	md5Data := tools.HmacMD5(a.Key, b[len(b)-8:len(b)-1])
++
++	randDataLength := udpGetRandLength(md5Data, &a.randomServer)
++	if randDataLength > len(b)-8 {
++		return nil, errAuthChainLengthError
++	}
++
++	key := tools.KDF(base64.StdEncoding.EncodeToString(a.userKey)+base64.StdEncoding.EncodeToString(md5Data), 16)
++	rc4Cipher, err := rc4.NewCipher(key)
++	if err != nil {
++		return nil, err
++	}
++	wantedData := b[:len(b)-8-randDataLength]
++	rc4Cipher.XORKeyStream(wantedData, wantedData)
++	return wantedData, nil
++}
++
++func (a *authChainA) EncodePacket(buf *bytes.Buffer, b []byte) error {
++	a.packetWriteMu.Lock()
++	defer a.packetWriteMu.Unlock()
++	authData := pool.Get(3)
++	defer pool.Put(authData)
++	rand.Read(authData)
++
++	md5Data := tools.HmacMD5(a.Key, authData)
++
++	randDataLength := udpGetRandLength(md5Data, &a.randomClient)
++
++	key := tools.KDF(base64.StdEncoding.EncodeToString(a.userKey)+base64.StdEncoding.EncodeToString(md5Data), 16)
++	rc4Cipher, err := rc4.NewCipher(key)
++	if err != nil {
++		return err
++	}
++	rc4Cipher.XORKeyStream(b, b)
++
++	buf.Write(b)
++	tools.AppendRandBytes(buf, randDataLength)
++	buf.Write(authData)
++	binary.Write(buf, binary.LittleEndian, binary.LittleEndian.Uint32(a.userID[:])^binary.LittleEndian.Uint32(md5Data[:4]))
++	buf.Write(tools.HmacMD5(a.userKey, buf.Bytes())[:1])
++	return nil
++}
++
++func (a *authChainA) packAuthData(poolBuf *bytes.Buffer, data []byte) {
++	/*
++		dataLength := len(data)
++		12:	checkHead(4) and hmac of checkHead(8)
++		4:	uint32 LittleEndian uid (uid = userID ^ last client hash)
++		16:	encrypted data of authdata(12), uint16 LittleEndian overhead(2) and uint16 LittleEndian number zero(2)
++		4:	last server hash(4)
++		packedAuthDataLength := 12 + 4 + 16 + 4 + dataLength
++	*/
++
++	macKey := pool.Get(len(a.iv) + len(a.Key))
++	defer pool.Put(macKey)
++	copy(macKey, a.iv)
++	copy(macKey[len(a.iv):], a.Key)
++
++	// check head
++	tools.AppendRandBytes(poolBuf, 4)
++	a.lastClientHash = tools.HmacMD5(macKey, poolBuf.Bytes())
++	a.initRC4Cipher()
++	poolBuf.Write(a.lastClientHash[:8])
++	// uid
++	binary.Write(poolBuf, binary.LittleEndian, binary.LittleEndian.Uint32(a.userID[:])^binary.LittleEndian.Uint32(a.lastClientHash[8:12]))
++	// encrypted data
++	err := a.putEncryptedData(poolBuf, a.userKey, [2]int{a.Overhead, 0}, a.salt)
++	if err != nil {
++		poolBuf.Reset()
++		return
++	}
++	// last server hash
++	a.lastServerHash = tools.HmacMD5(a.userKey, poolBuf.Bytes()[12:])
++	poolBuf.Write(a.lastServerHash[:4])
++	// packed data
++	a.packData(poolBuf, data)
++}
++
++func (a *authChainA) packData(poolBuf *bytes.Buffer, data []byte) {
++	a.encrypter.XORKeyStream(data, data)
++
++	macKey := pool.Get(len(a.userKey) + 4)
++	defer pool.Put(macKey)
++	copy(macKey, a.userKey)
++	binary.LittleEndian.PutUint32(macKey[len(a.userKey):], a.packID)
++	a.packID++
++
++	length := uint16(len(data)) ^ binary.LittleEndian.Uint16(a.lastClientHash[14:16])
++
++	originalLength := poolBuf.Len()
++	binary.Write(poolBuf, binary.LittleEndian, length)
++	a.putMixedRandDataAndData(poolBuf, data)
++	a.lastClientHash = tools.HmacMD5(macKey, poolBuf.Bytes()[originalLength:])
++	poolBuf.Write(a.lastClientHash[:2])
++}
++
++func (a *authChainA) putMixedRandDataAndData(poolBuf *bytes.Buffer, data []byte) {
++	randDataLength := a.randDataLength(len(data), a.lastClientHash, &a.randomClient)
++	if len(data) == 0 {
++		tools.AppendRandBytes(poolBuf, randDataLength)
++		return
++	}
++	if randDataLength > 0 {
++		startPos := getRandStartPos(randDataLength, &a.randomClient)
++		tools.AppendRandBytes(poolBuf, startPos)
++		poolBuf.Write(data)
++		tools.AppendRandBytes(poolBuf, randDataLength-startPos)
++		return
++	}
++	poolBuf.Write(data)
++}
++
++func getRandStartPos(length int, random *tools.XorShift128Plus) int {
++	if length == 0 {
++		return 0
++	}
++	return int(int64(random.Next()%8589934609) % int64(length))
++}
++
++func (a *authChainA) getRandLength(length int, lastHash []byte, random *tools.XorShift128Plus) int {
++	if length > 1440 {
++		return 0
++	}
++	random.InitFromBinAndLength(lastHash, length)
++	if length > 1300 {
++		return int(random.Next() % 31)
++	}
++	if length > 900 {
++		return int(random.Next() % 127)
++	}
++	if length > 400 {
++		return int(random.Next() % 521)
++	}
++	return int(random.Next() % 1021)
++}
++
++func (a *authChainA) initRC4Cipher() {
++	key := tools.KDF(base64.StdEncoding.EncodeToString(a.userKey)+base64.StdEncoding.EncodeToString(a.lastClientHash), 16)
++	a.encrypter, _ = rc4.NewCipher(key)
++	a.decrypter, _ = rc4.NewCipher(key)
++}
++
++func udpGetRandLength(lastHash []byte, random *tools.XorShift128Plus) int {
++	random.InitFromBin(lastHash)
++	return int(random.Next() % 127)
++}
+diff --git a/transport/clashssr/protocol/auth_chain_b.go b/transport/clashssr/protocol/auth_chain_b.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e3176008fa5dc4dc3224896e239ed48d383b554
+--- /dev/null
++++ b/transport/clashssr/protocol/auth_chain_b.go
+@@ -0,0 +1,97 @@
++package protocol
++
++import (
++	"net"
++	"sort"
++
++	"github.com/sagernet/sing-box/transport/clashssr/internal/tools"
++)
++
++func init() {
++	register("auth_chain_b", newAuthChainB, 4)
++}
++
++type authChainB struct {
++	*authChainA
++	dataSizeList  []int
++	dataSizeList2 []int
++}
++
++func newAuthChainB(b *Base) Protocol {
++	a := &authChainB{
++		authChainA: &authChainA{
++			Base:     b,
++			authData: &authData{},
++			userData: &userData{},
++			salt:     "auth_chain_b",
++		},
++	}
++	a.initUserData()
++	return a
++}
++
++func (a *authChainB) StreamConn(c net.Conn, iv []byte) net.Conn {
++	p := &authChainB{
++		authChainA: &authChainA{
++			Base:     a.Base,
++			authData: a.next(),
++			userData: a.userData,
++			salt:     a.salt,
++			packID:   1,
++			recvID:   1,
++		},
++	}
++	p.iv = iv
++	p.randDataLength = p.getRandLength
++	p.initDataSize()
++	return &Conn{Conn: c, Protocol: p}
++}
++
++func (a *authChainB) initDataSize() {
++	a.dataSizeList = a.dataSizeList[:0]
++	a.dataSizeList2 = a.dataSizeList2[:0]
++
++	a.randomServer.InitFromBin(a.Key)
++	length := a.randomServer.Next()%8 + 4
++	for ; length > 0; length-- {
++		a.dataSizeList = append(a.dataSizeList, int(a.randomServer.Next()%2340%2040%1440))
++	}
++	sort.Ints(a.dataSizeList)
++
++	length = a.randomServer.Next()%16 + 8
++	for ; length > 0; length-- {
++		a.dataSizeList2 = append(a.dataSizeList2, int(a.randomServer.Next()%2340%2040%1440))
++	}
++	sort.Ints(a.dataSizeList2)
++}
++
++func (a *authChainB) getRandLength(length int, lashHash []byte, random *tools.XorShift128Plus) int {
++	if length >= 1440 {
++		return 0
++	}
++	random.InitFromBinAndLength(lashHash, length)
++	pos := sort.Search(len(a.dataSizeList), func(i int) bool { return a.dataSizeList[i] >= length+a.Overhead })
++	finalPos := pos + int(random.Next()%uint64(len(a.dataSizeList)))
++	if finalPos < len(a.dataSizeList) {
++		return a.dataSizeList[finalPos] - length - a.Overhead
++	}
++
++	pos = sort.Search(len(a.dataSizeList2), func(i int) bool { return a.dataSizeList2[i] >= length+a.Overhead })
++	finalPos = pos + int(random.Next()%uint64(len(a.dataSizeList2)))
++	if finalPos < len(a.dataSizeList2) {
++		return a.dataSizeList2[finalPos] - length - a.Overhead
++	}
++	if finalPos < pos+len(a.dataSizeList2)-1 {
++		return 0
++	}
++	if length > 1300 {
++		return int(random.Next() % 31)
++	}
++	if length > 900 {
++		return int(random.Next() % 127)
++	}
++	if length > 400 {
++		return int(random.Next() % 521)
++	}
++	return int(random.Next() % 1021)
++}
+diff --git a/transport/clashssr/protocol/auth_sha1_v4.go b/transport/clashssr/protocol/auth_sha1_v4.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ee472d743b31f95d19ecfed588e9c11bfbbc23ce
+--- /dev/null
++++ b/transport/clashssr/protocol/auth_sha1_v4.go
+@@ -0,0 +1,182 @@
++package protocol
++
++import (
++	"bytes"
++	"encoding/binary"
++	"hash/adler32"
++	"hash/crc32"
++	"math/rand"
++	"net"
++
++	"github.com/sagernet/sing-box/transport/clashssr/internal/pool"
++	"github.com/sagernet/sing-box/transport/clashssr/internal/tools"
++)
++
++func init() {
++	register("auth_sha1_v4", newAuthSHA1V4, 7)
++}
++
++type authSHA1V4 struct {
++	*Base
++	*authData
++	iv            []byte
++	hasSentHeader bool
++	rawTrans      bool
++}
++
++func newAuthSHA1V4(b *Base) Protocol {
++	return &authSHA1V4{Base: b, authData: &authData{}}
++}
++
++func (a *authSHA1V4) StreamConn(c net.Conn, iv []byte) net.Conn {
++	p := &authSHA1V4{Base: a.Base, authData: a.next()}
++	p.iv = iv
++	return &Conn{Conn: c, Protocol: p}
++}
++
++func (a *authSHA1V4) PacketConn(c net.PacketConn) net.PacketConn {
++	return c
++}
++
++func (a *authSHA1V4) Decode(dst, src *bytes.Buffer) error {
++	if a.rawTrans {
++		dst.ReadFrom(src)
++		return nil
++	}
++	for src.Len() > 4 {
++		if uint16(crc32.ChecksumIEEE(src.Bytes()[:2])&0xffff) != binary.LittleEndian.Uint16(src.Bytes()[2:4]) {
++			src.Reset()
++			return errAuthSHA1V4CRC32Error
++		}
++
++		length := int(binary.BigEndian.Uint16(src.Bytes()[:2]))
++		if length >= 8192 || length < 7 {
++			a.rawTrans = true
++			src.Reset()
++			return errAuthSHA1V4LengthError
++		}
++		if length > src.Len() {
++			break
++		}
++
++		if adler32.Checksum(src.Bytes()[:length-4]) != binary.LittleEndian.Uint32(src.Bytes()[length-4:length]) {
++			a.rawTrans = true
++			src.Reset()
++			return errAuthSHA1V4Adler32Error
++		}
++
++		pos := int(src.Bytes()[4])
++		if pos < 255 {
++			pos += 4
++		} else {
++			pos = int(binary.BigEndian.Uint16(src.Bytes()[5:7])) + 4
++		}
++		dst.Write(src.Bytes()[pos : length-4])
++		src.Next(length)
++	}
++	return nil
++}
++
++func (a *authSHA1V4) Encode(buf *bytes.Buffer, b []byte) error {
++	if !a.hasSentHeader {
++		dataLength := getDataLength(b)
++
++		a.packAuthData(buf, b[:dataLength])
++		b = b[dataLength:]
++
++		a.hasSentHeader = true
++	}
++	for len(b) > 8100 {
++		a.packData(buf, b[:8100])
++		b = b[8100:]
++	}
++	if len(b) > 0 {
++		a.packData(buf, b)
++	}
++
++	return nil
++}
++
++func (a *authSHA1V4) DecodePacket(b []byte) ([]byte, error) { return b, nil }
++
++func (a *authSHA1V4) EncodePacket(buf *bytes.Buffer, b []byte) error {
++	buf.Write(b)
++	return nil
++}
++
++func (a *authSHA1V4) packData(poolBuf *bytes.Buffer, data []byte) {
++	dataLength := len(data)
++	randDataLength := a.getRandDataLength(dataLength)
++	/*
++		2:	uint16 BigEndian packedDataLength
++		2:	uint16 LittleEndian crc32Data & 0xffff
++		3:	maxRandDataLengthPrefix (min:1)
++		4:	adler32Data
++	*/
++	packedDataLength := 2 + 2 + 3 + randDataLength + dataLength + 4
++	if randDataLength < 128 {
++		packedDataLength -= 2
++	}
++
++	binary.Write(poolBuf, binary.BigEndian, uint16(packedDataLength))
++	binary.Write(poolBuf, binary.LittleEndian, uint16(crc32.ChecksumIEEE(poolBuf.Bytes()[poolBuf.Len()-2:])&0xffff))
++	a.packRandData(poolBuf, randDataLength)
++	poolBuf.Write(data)
++	binary.Write(poolBuf, binary.LittleEndian, adler32.Checksum(poolBuf.Bytes()[poolBuf.Len()-packedDataLength+4:]))
++}
++
++func (a *authSHA1V4) packAuthData(poolBuf *bytes.Buffer, data []byte) {
++	dataLength := len(data)
++	randDataLength := a.getRandDataLength(12 + dataLength)
++	/*
++		2:	uint16 BigEndian packedAuthDataLength
++		4:	uint32 LittleEndian crc32Data
++		3:	maxRandDataLengthPrefix (min: 1)
++		12:	authDataLength
++		10:	hmacSHA1DataLength
++	*/
++	packedAuthDataLength := 2 + 4 + 3 + randDataLength + 12 + dataLength + 10
++	if randDataLength < 128 {
++		packedAuthDataLength -= 2
++	}
++
++	salt := []byte("auth_sha1_v4")
++	crcData := pool.Get(len(salt) + len(a.Key) + 2)
++	defer pool.Put(crcData)
++	binary.BigEndian.PutUint16(crcData, uint16(packedAuthDataLength))
++	copy(crcData[2:], salt)
++	copy(crcData[2+len(salt):], a.Key)
++
++	key := pool.Get(len(a.iv) + len(a.Key))
++	defer pool.Put(key)
++	copy(key, a.iv)
++	copy(key[len(a.iv):], a.Key)
++
++	poolBuf.Write(crcData[:2])
++	binary.Write(poolBuf, binary.LittleEndian, crc32.ChecksumIEEE(crcData))
++	a.packRandData(poolBuf, randDataLength)
++	a.putAuthData(poolBuf)
++	poolBuf.Write(data)
++	poolBuf.Write(tools.HmacSHA1(key, poolBuf.Bytes()[poolBuf.Len()-packedAuthDataLength+10:])[:10])
++}
++
++func (a *authSHA1V4) packRandData(poolBuf *bytes.Buffer, size int) {
++	if size < 128 {
++		poolBuf.WriteByte(byte(size + 1))
++		tools.AppendRandBytes(poolBuf, size)
++		return
++	}
++	poolBuf.WriteByte(255)
++	binary.Write(poolBuf, binary.BigEndian, uint16(size+3))
++	tools.AppendRandBytes(poolBuf, size)
++}
++
++func (a *authSHA1V4) getRandDataLength(size int) int {
++	if size > 1200 {
++		return 0
++	}
++	if size > 400 {
++		return rand.Intn(256)
++	}
++	return rand.Intn(512)
++}
+diff --git a/transport/clashssr/protocol/base.go b/transport/clashssr/protocol/base.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..672eb30d33d7c5e495ff9f6412eaede90a880218
+--- /dev/null
++++ b/transport/clashssr/protocol/base.go
+@@ -0,0 +1,75 @@
++package protocol
++
++import (
++	"bytes"
++	"crypto/aes"
++	"crypto/cipher"
++	"encoding/base64"
++	"encoding/binary"
++	"math/rand"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/transport/clashssr/internal/pool"
++	"github.com/sagernet/sing-box/transport/clashssr/internal/tools"
++)
++
++type Base struct {
++	Key      []byte
++	Overhead int
++	Param    string
++}
++
++type userData struct {
++	userKey []byte
++	userID  [4]byte
++}
++
++type authData struct {
++	clientID     [4]byte
++	connectionID uint32
++	mutex        sync.Mutex
++}
++
++func (a *authData) next() *authData {
++	r := &authData{}
++	a.mutex.Lock()
++	defer a.mutex.Unlock()
++	if a.connectionID > 0xff000000 || a.connectionID == 0 {
++		rand.Read(a.clientID[:])
++		a.connectionID = rand.Uint32() & 0xffffff
++	}
++	a.connectionID++
++	copy(r.clientID[:], a.clientID[:])
++	r.connectionID = a.connectionID
++	return r
++}
++
++func (a *authData) putAuthData(buf *bytes.Buffer) {
++	binary.Write(buf, binary.LittleEndian, uint32(time.Now().Unix()))
++	buf.Write(a.clientID[:])
++	binary.Write(buf, binary.LittleEndian, a.connectionID)
++}
++
++func (a *authData) putEncryptedData(b *bytes.Buffer, userKey []byte, paddings [2]int, salt string) error {
++	encrypt := pool.Get(16)
++	defer pool.Put(encrypt)
++	binary.LittleEndian.PutUint32(encrypt, uint32(time.Now().Unix()))
++	copy(encrypt[4:], a.clientID[:])
++	binary.LittleEndian.PutUint32(encrypt[8:], a.connectionID)
++	binary.LittleEndian.PutUint16(encrypt[12:], uint16(paddings[0]))
++	binary.LittleEndian.PutUint16(encrypt[14:], uint16(paddings[1]))
++
++	cipherKey := tools.KDF(base64.StdEncoding.EncodeToString(userKey)+salt, 16)
++	block, err := aes.NewCipher(cipherKey)
++	if err != nil {
++		return err
++	}
++	iv := bytes.Repeat([]byte{0}, 16)
++	cbcCipher := cipher.NewCBCEncrypter(block, iv)
++
++	cbcCipher.CryptBlocks(encrypt, encrypt)
++
++	b.Write(encrypt)
++	return nil
++}
+diff --git a/transport/clashssr/protocol/origin.go b/transport/clashssr/protocol/origin.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..80fdfa9a1b4f4eaf4a75ceeba2ffb064352bdb5c
+--- /dev/null
++++ b/transport/clashssr/protocol/origin.go
+@@ -0,0 +1,33 @@
++package protocol
++
++import (
++	"bytes"
++	"net"
++)
++
++type origin struct{}
++
++func init() { register("origin", newOrigin, 0) }
++
++func newOrigin(b *Base) Protocol { return &origin{} }
++
++func (o *origin) StreamConn(c net.Conn, iv []byte) net.Conn { return c }
++
++func (o *origin) PacketConn(c net.PacketConn) net.PacketConn { return c }
++
++func (o *origin) Decode(dst, src *bytes.Buffer) error {
++	dst.ReadFrom(src)
++	return nil
++}
++
++func (o *origin) Encode(buf *bytes.Buffer, b []byte) error {
++	buf.Write(b)
++	return nil
++}
++
++func (o *origin) DecodePacket(b []byte) ([]byte, error) { return b, nil }
++
++func (o *origin) EncodePacket(buf *bytes.Buffer, b []byte) error {
++	buf.Write(b)
++	return nil
++}
+diff --git a/transport/clashssr/protocol/packet.go b/transport/clashssr/protocol/packet.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..df9c17c670c6f70d95e0889df82b8c72dce89d52
+--- /dev/null
++++ b/transport/clashssr/protocol/packet.go
+@@ -0,0 +1,36 @@
++package protocol
++
++import (
++	"net"
++
++	"github.com/sagernet/sing-box/transport/clashssr/internal/pool"
++)
++
++type PacketConn struct {
++	net.PacketConn
++	Protocol
++}
++
++func (c *PacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
++	buf := pool.GetBuffer()
++	defer pool.PutBuffer(buf)
++	err := c.EncodePacket(buf, b)
++	if err != nil {
++		return 0, err
++	}
++	_, err = c.PacketConn.WriteTo(buf.Bytes(), addr)
++	return len(b), err
++}
++
++func (c *PacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
++	n, addr, err := c.PacketConn.ReadFrom(b)
++	if err != nil {
++		return n, addr, err
++	}
++	decoded, err := c.DecodePacket(b[:n])
++	if err != nil {
++		return n, addr, err
++	}
++	copy(b, decoded)
++	return len(decoded), addr, nil
++}
+diff --git a/transport/clashssr/protocol/protocol.go b/transport/clashssr/protocol/protocol.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..41bd984c8b76cc052e1ad0e264c80f7f00e640a4
+--- /dev/null
++++ b/transport/clashssr/protocol/protocol.go
+@@ -0,0 +1,76 @@
++package protocol
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++	"math/rand"
++	"net"
++)
++
++var (
++	errAuthSHA1V4CRC32Error   = errors.New("auth_sha1_v4 decode data wrong crc32")
++	errAuthSHA1V4LengthError  = errors.New("auth_sha1_v4 decode data wrong length")
++	errAuthSHA1V4Adler32Error = errors.New("auth_sha1_v4 decode data wrong adler32")
++	errAuthAES128MACError     = errors.New("auth_aes128 decode data wrong mac")
++	errAuthAES128LengthError  = errors.New("auth_aes128 decode data wrong length")
++	errAuthAES128ChksumError  = errors.New("auth_aes128 decode data wrong checksum")
++	errAuthChainLengthError   = errors.New("auth_chain decode data wrong length")
++	errAuthChainChksumError   = errors.New("auth_chain decode data wrong checksum")
++)
++
++type Protocol interface {
++	StreamConn(net.Conn, []byte) net.Conn
++	PacketConn(net.PacketConn) net.PacketConn
++	Decode(dst, src *bytes.Buffer) error
++	Encode(buf *bytes.Buffer, b []byte) error
++	DecodePacket([]byte) ([]byte, error)
++	EncodePacket(buf *bytes.Buffer, b []byte) error
++}
++
++type protocolCreator func(b *Base) Protocol
++
++var protocolList = make(map[string]struct {
++	overhead int
++	new      protocolCreator
++})
++
++func register(name string, c protocolCreator, o int) {
++	protocolList[name] = struct {
++		overhead int
++		new      protocolCreator
++	}{overhead: o, new: c}
++}
++
++func PickProtocol(name string, b *Base) (Protocol, error) {
++	if choice, ok := protocolList[name]; ok {
++		b.Overhead += choice.overhead
++		return choice.new(b), nil
++	}
++	return nil, fmt.Errorf("protocol %s not supported", name)
++}
++
++func getHeadSize(b []byte, defaultValue int) int {
++	if len(b) < 2 {
++		return defaultValue
++	}
++	headType := b[0] & 7
++	switch headType {
++	case 1:
++		return 7
++	case 4:
++		return 19
++	case 3:
++		return 4 + int(b[1])
++	}
++	return defaultValue
++}
++
++func getDataLength(b []byte) int {
++	bLength := len(b)
++	dataLength := getHeadSize(b, 30) + rand.Intn(32)
++	if bLength < dataLength {
++		return bLength
++	}
++	return dataLength
++}
+diff --git a/transport/clashssr/protocol/stream.go b/transport/clashssr/protocol/stream.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6bfd36826b711946cf500e6ccd1a346634706cc
+--- /dev/null
++++ b/transport/clashssr/protocol/stream.go
+@@ -0,0 +1,50 @@
++package protocol
++
++import (
++	"bytes"
++	"net"
++
++	"github.com/sagernet/sing-box/transport/clashssr/internal/pool"
++)
++
++type Conn struct {
++	net.Conn
++	Protocol
++	decoded      bytes.Buffer
++	underDecoded bytes.Buffer
++}
++
++func (c *Conn) Read(b []byte) (int, error) {
++	if c.decoded.Len() > 0 {
++		return c.decoded.Read(b)
++	}
++
++	buf := pool.Get(pool.RelayBufferSize)
++	defer pool.Put(buf)
++	n, err := c.Conn.Read(buf)
++	if err != nil {
++		return 0, err
++	}
++	c.underDecoded.Write(buf[:n])
++	err = c.Decode(&c.decoded, &c.underDecoded)
++	if err != nil {
++		return 0, err
++	}
++	n, _ = c.decoded.Read(b)
++	return n, nil
++}
++
++func (c *Conn) Write(b []byte) (int, error) {
++	bLength := len(b)
++	buf := pool.GetBuffer()
++	defer pool.PutBuffer(buf)
++	err := c.Encode(buf, b)
++	if err != nil {
++		return 0, err
++	}
++	_, err = c.Conn.Write(buf.Bytes())
++	if err != nil {
++		return 0, err
++	}
++	return bLength, nil
++}
+diff --git a/transport/clashssr/shadowstream/cipher.go b/transport/clashssr/shadowstream/cipher.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..9af8e2b8f06db3a0d65192dff8f63f63b3c9ffa6
+--- /dev/null
++++ b/transport/clashssr/shadowstream/cipher.go
+@@ -0,0 +1,268 @@
++package shadowstream
++
++import (
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/md5"
++	"crypto/rand"
++	"crypto/rc4"
++	"fmt"
++	"io"
++	"net"
++	"sync"
++
++	"golang.org/x/crypto/chacha20"
++)
++
++type streamConstructor func(key, iv []byte) (cipher.Stream, error)
++
++type Cipher struct {
++	key     []byte
++	ivSize  int
++	encrypt streamConstructor
++	decrypt streamConstructor
++	dummy   bool
++}
++
++func New(method, password string) (*Cipher, error) {
++	result := &Cipher{}
++	var keySize int
++	switch method {
++	case "none", "dummy":
++		if password == "" {
++			return nil, fmt.Errorf("ShadowsocksR password is empty")
++		}
++		result.dummy = true
++		result.key = kdf(password, 16)
++		return result, nil
++	case "aes-128-cfb":
++		keySize, result.ivSize = 16, aes.BlockSize
++		result.encrypt, result.decrypt = blockStream(cipher.NewCFBEncrypter), blockStream(cipher.NewCFBDecrypter)
++	case "aes-192-cfb":
++		keySize, result.ivSize = 24, aes.BlockSize
++		result.encrypt, result.decrypt = blockStream(cipher.NewCFBEncrypter), blockStream(cipher.NewCFBDecrypter)
++	case "aes-256-cfb":
++		keySize, result.ivSize = 32, aes.BlockSize
++		result.encrypt, result.decrypt = blockStream(cipher.NewCFBEncrypter), blockStream(cipher.NewCFBDecrypter)
++	case "aes-128-ctr":
++		keySize, result.ivSize = 16, aes.BlockSize
++		result.encrypt, result.decrypt = blockStream(cipher.NewCTR), blockStream(cipher.NewCTR)
++	case "aes-192-ctr":
++		keySize, result.ivSize = 24, aes.BlockSize
++		result.encrypt, result.decrypt = blockStream(cipher.NewCTR), blockStream(cipher.NewCTR)
++	case "aes-256-ctr":
++		keySize, result.ivSize = 32, aes.BlockSize
++		result.encrypt, result.decrypt = blockStream(cipher.NewCTR), blockStream(cipher.NewCTR)
++	case "aes-128-ofb":
++		keySize, result.ivSize = 16, aes.BlockSize
++		result.encrypt, result.decrypt = blockStream(cipher.NewOFB), blockStream(cipher.NewOFB)
++	case "aes-192-ofb":
++		keySize, result.ivSize = 24, aes.BlockSize
++		result.encrypt, result.decrypt = blockStream(cipher.NewOFB), blockStream(cipher.NewOFB)
++	case "aes-256-ofb":
++		keySize, result.ivSize = 32, aes.BlockSize
++		result.encrypt, result.decrypt = blockStream(cipher.NewOFB), blockStream(cipher.NewOFB)
++	case "rc4-md5":
++		keySize, result.ivSize = 16, 16
++		result.encrypt, result.decrypt = rc4MD5Stream, rc4MD5Stream
++	case "rc4-md5-6":
++		keySize, result.ivSize = 16, 6
++		result.encrypt, result.decrypt = rc4MD5Stream, rc4MD5Stream
++	case "chacha20-ietf":
++		keySize, result.ivSize = chacha20.KeySize, chacha20.NonceSize
++		result.encrypt, result.decrypt = chachaStream, chachaStream
++	default:
++		return nil, fmt.Errorf("unsupported ShadowsocksR cipher: %s", method)
++	}
++	if password == "" {
++		return nil, fmt.Errorf("ShadowsocksR password is empty")
++	}
++	result.key = kdf(password, keySize)
++	return result, nil
++}
++
++func blockStream(factory func(cipher.Block, []byte) cipher.Stream) streamConstructor {
++	return func(key, iv []byte) (cipher.Stream, error) {
++		block, err := aes.NewCipher(key)
++		if err != nil {
++			return nil, err
++		}
++		return factory(block, iv), nil
++	}
++}
++
++func rc4MD5Stream(key, iv []byte) (cipher.Stream, error) {
++	hash := md5.New()
++	hash.Write(key)
++	hash.Write(iv)
++	return rc4.NewCipher(hash.Sum(nil))
++}
++
++func chachaStream(key, iv []byte) (cipher.Stream, error) {
++	return chacha20.NewUnauthenticatedCipher(key, iv)
++}
++
++func kdf(password string, keyLength int) []byte {
++	var result, previous []byte
++	for len(result) < keyLength {
++		hash := md5.New()
++		hash.Write(previous)
++		hash.Write([]byte(password))
++		result = hash.Sum(result)
++		previous = result[len(result)-hash.Size():]
++	}
++	return result[:keyLength]
++}
++
++func (c *Cipher) Key() []byte                    { return append([]byte(nil), c.key...) }
++func (c *Cipher) IVSize() int                    { return c.ivSize }
++func (c *Cipher) StreamConn(conn net.Conn) *Conn { return &Conn{Conn: conn, cipher: c} }
++func (c *Cipher) PacketConn(conn net.PacketConn) net.PacketConn {
++	return &packetConn{PacketConn: conn, cipher: c}
++}
++
++type Conn struct {
++	net.Conn
++	cipher      *Cipher
++	readStream  cipher.Stream
++	writeStream cipher.Stream
++	writeIV     []byte
++	writeIVSent bool
++	readMutex   sync.Mutex
++	writeMutex  sync.Mutex
++}
++
++func (c *Conn) ObtainWriteIV() ([]byte, error) {
++	c.writeMutex.Lock()
++	defer c.writeMutex.Unlock()
++	if c.cipher.dummy {
++		return nil, nil
++	}
++	if c.writeStream == nil {
++		c.writeIV = make([]byte, c.cipher.ivSize)
++		if _, err := io.ReadFull(rand.Reader, c.writeIV); err != nil {
++			return nil, err
++		}
++		stream, err := c.cipher.encrypt(c.cipher.key, c.writeIV)
++		if err != nil {
++			return nil, err
++		}
++		c.writeStream = stream
++	}
++	return append([]byte(nil), c.writeIV...), nil
++}
++
++func (c *Conn) Read(data []byte) (int, error) {
++	c.readMutex.Lock()
++	defer c.readMutex.Unlock()
++	if c.cipher.dummy {
++		return c.Conn.Read(data)
++	}
++	if c.readStream == nil {
++		iv := make([]byte, c.cipher.ivSize)
++		if _, err := io.ReadFull(c.Conn, iv); err != nil {
++			return 0, err
++		}
++		stream, err := c.cipher.decrypt(c.cipher.key, iv)
++		if err != nil {
++			return 0, err
++		}
++		c.readStream = stream
++	}
++	n, err := c.Conn.Read(data)
++	if n > 0 {
++		c.readStream.XORKeyStream(data[:n], data[:n])
++	}
++	return n, err
++}
++
++func (c *Conn) Write(data []byte) (int, error) {
++	c.writeMutex.Lock()
++	defer c.writeMutex.Unlock()
++	if c.cipher.dummy {
++		return c.Conn.Write(data)
++	}
++	if c.writeStream == nil {
++		c.writeIV = make([]byte, c.cipher.ivSize)
++		if _, err := io.ReadFull(rand.Reader, c.writeIV); err != nil {
++			return 0, err
++		}
++		stream, err := c.cipher.encrypt(c.cipher.key, c.writeIV)
++		if err != nil {
++			return 0, err
++		}
++		c.writeStream = stream
++	}
++	packet := append([]byte(nil), data...)
++	c.writeStream.XORKeyStream(packet, packet)
++	if !c.writeIVSent {
++		packet = append(append(make([]byte, 0, len(c.writeIV)+len(packet)), c.writeIV...), packet...)
++		c.writeIVSent = true
++	}
++	if err := writeFull(c.Conn, packet); err != nil {
++		return 0, err
++	}
++	return len(data), nil
++}
++
++func writeFull(writer io.Writer, data []byte) error {
++	for len(data) > 0 {
++		n, err := writer.Write(data)
++		if err != nil {
++			return err
++		}
++		if n == 0 {
++			return io.ErrShortWrite
++		}
++		data = data[n:]
++	}
++	return nil
++}
++
++type packetConn struct {
++	net.PacketConn
++	cipher *Cipher
++}
++
++func (c *packetConn) WriteTo(data []byte, address net.Addr) (int, error) {
++	if c.cipher.dummy {
++		return c.PacketConn.WriteTo(data, address)
++	}
++	iv := make([]byte, c.cipher.ivSize)
++	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
++		return 0, err
++	}
++	stream, err := c.cipher.encrypt(c.cipher.key, iv)
++	if err != nil {
++		return 0, err
++	}
++	packet := make([]byte, len(iv)+len(data))
++	copy(packet, iv)
++	copy(packet[len(iv):], data)
++	stream.XORKeyStream(packet[len(iv):], packet[len(iv):])
++	if _, err = c.PacketConn.WriteTo(packet, address); err != nil {
++		return 0, err
++	}
++	return len(data), nil
++}
++
++func (c *packetConn) ReadFrom(data []byte) (int, net.Addr, error) {
++	if c.cipher.dummy {
++		return c.PacketConn.ReadFrom(data)
++	}
++	packet := make([]byte, len(data)+c.cipher.ivSize)
++	n, address, err := c.PacketConn.ReadFrom(packet)
++	if err != nil {
++		return 0, address, err
++	}
++	if n < c.cipher.ivSize {
++		return 0, address, io.ErrUnexpectedEOF
++	}
++	stream, err := c.cipher.decrypt(c.cipher.key, packet[:c.cipher.ivSize])
++	if err != nil {
++		return 0, address, err
++	}
++	payload := packet[c.cipher.ivSize:n]
++	stream.XORKeyStream(payload, payload)
++	return copy(data, payload), address, nil
++}

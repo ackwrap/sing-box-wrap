@@ -1,0 +1,15 @@
+diff --git a/service/oomkiller/service_darwin.go b/service/oomkiller/service_darwin.go
+index 166ddc7ddfd0ffcac39855c48c2d568b147442df..67ab6bd4ed8fc9e18bb4e9467586b8efad2fc879 100644
+--- a/service/oomkiller/service_darwin.go
++++ b/service/oomkiller/service_darwin.go
+@@ -120,7 +120,9 @@ func (s *Service) writeOOMDraft(memoryUsage uint64) {
+ 	if time.Duration(now-lastDraft) < oomDraftMinInterval {
+ 		return
+ 	}
+-	s.lastDraftTime.Store(now)
++	if !s.lastDraftTime.CompareAndSwap(lastDraft, now) {
++		return
++	}
+ 	reporter := service.FromContext[OOMReporter](s.ctx)
+ 	if reporter == nil {
+ 		return

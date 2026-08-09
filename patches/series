@@ -1,0 +1,6 @@
+0001-runtime-routing.patch
+0002-outbound-exit-ip.patch
+0003-certificate-sha256.patch
+0004-shadowsocksr-outbound.patch
+0005-vless-encryption.patch
+0006-oom-draft-race.patch

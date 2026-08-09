@@ -1,0 +1,42 @@
+name: Verify Patch Stack
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          submodules: true
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25
+      - name: Prepare patched source
+        run: python scripts/prepare_core.py --output "${{ runner.temp }}/sing-box"
+      - name: Verify modules
+        working-directory: ${{ runner.temp }}/sing-box
+        run: go mod tidy && git diff --exit-code -- go.mod go.sum
+      - name: Build
+        working-directory: ${{ runner.temp }}/sing-box
+        run: go build ./...

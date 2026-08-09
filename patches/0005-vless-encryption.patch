@@ -1,0 +1,121 @@
+diff --git a/go.mod b/go.mod
+index 856b1089bbddf1e02a89936a58008afb44455101..c1cf6cdea55d9a7dc53a0c9d111d974764fd575e 100644
+--- a/go.mod
++++ b/go.mod
+@@ -80,6 +80,8 @@ require (
+ 	howett.net/plist v1.0.1
+ )
+ 
++replace github.com/sagernet/sing-vmess => github.com/ackwrap/sing-vmess v0.2.8-ackwrap.1
++
+ require (
+ 	filippo.io/edwards25519 v1.2.0 // indirect
+ 	filippo.io/hpke v0.4.0 // indirect
+diff --git a/go.sum b/go.sum
+index 86d82b00d8d826b0389321e6245487ad89330a1b..1adbcd2d9912e13be4262005393bcede97283c4c 100644
+--- a/go.sum
++++ b/go.sum
+@@ -14,6 +14,8 @@ github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp
+ github.com/RyuaNerin/go-krypto v1.3.0/go.mod h1:9R9TU936laAIqAmjcHo/LsaXYOZlymudOAxjaBf62UM=
+ github.com/RyuaNerin/testingutil v0.1.0 h1:IYT6JL57RV3U2ml3dLHZsVtPOP6yNK7WUVdzzlpNrss=
+ github.com/RyuaNerin/testingutil v0.1.0/go.mod h1:yTqj6Ta/ycHMPJHRyO12Mz3VrvTloWOsy23WOZH19AA=
++github.com/ackwrap/sing-vmess v0.2.8-ackwrap.1 h1:FNLoCNGS0pw0zaNEb+T1xsfq4Ly+W6ev5NKyun2pwlU=
++github.com/ackwrap/sing-vmess v0.2.8-ackwrap.1/go.mod h1:R3IXQ2AqCmWvbt5O3H2m/J358EojW7U1t9FrDmeMcPI=
+ github.com/ajg/form v1.5.1 h1:t9c7v8JUKu/XxOGBU0yjNpaMloxGEJhUkqFRq0ibGeU=
+ github.com/ajg/form v1.5.1/go.mod h1:uL1WgH+h2mgNtvBq0339dVnzXdBETtL2LeUXaIv25UY=
+ github.com/akutz/memconn v0.1.0 h1:NawI0TORU4hcOMsMr11g7vwlCdkYeLKXBcxWu2W/P8A=
+@@ -340,8 +342,6 @@ github.com/sagernet/sing-tun v0.8.12-0.20260805001200-da24acaf4de3 h1:LhMorA53T9
+ github.com/sagernet/sing-tun v0.8.12-0.20260805001200-da24acaf4de3/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
+ github.com/sagernet/sing-usbip v0.0.0-20260616101517-efb91521eddb h1:KEMbfexD4DvrQGYWwx6r+AwH9Veh8z6cnBZmtCS2G+0=
+ github.com/sagernet/sing-usbip v0.0.0-20260616101517-efb91521eddb/go.mod h1:D4CnJX3MNAAANhbQUxfIRgBdnvlTEaV7h6ojedcs+pw=
+-github.com/sagernet/sing-vmess v0.2.8-0.20250909125414-3aed155119a1 h1:aSwUNYUkVyVvdmBSufR8/nRFonwJeKSIROxHcm5br9o=
+-github.com/sagernet/sing-vmess v0.2.8-0.20250909125414-3aed155119a1/go.mod h1:P11scgTxMxVVQ8dlM27yNm3Cro40mD0+gHbnqrNGDuY=
+ github.com/sagernet/smux v1.5.50-sing-box-mod.1 h1:XkJcivBC9V4wBjiGXIXZ229aZCU1hzcbp6kSkkyQ478=
+ github.com/sagernet/smux v1.5.50-sing-box-mod.1/go.mod h1:NjhsCEWedJm7eFLyhuBgIEzwfhRmytrUoiLluxs5Sk8=
+ github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.2 h1:JXYUrqxvIYGVVvTz0xzYR6DufhLBfnV5wh5lwhbdJVM=
+diff --git a/option/vless.go b/option/vless.go
+index 5acf2aeed0b38d51e16e028a2759ea6149d36336..5c65dfacff22a2bedcf6bdaba31e948e62e3009e 100644
+--- a/option/vless.go
++++ b/option/vless.go
+@@ -17,9 +17,10 @@ type VLESSUser struct {
+ type VLESSOutboundOptions struct {
+ 	DialerOptions
+ 	ServerOptions
+-	UUID    string      `json:"uuid"`
+-	Flow    string      `json:"flow,omitempty"`
+-	Network NetworkList `json:"network,omitempty"`
++	UUID       string      `json:"uuid"`
++	Flow       string      `json:"flow,omitempty"`
++	Encryption string      `json:"encryption,omitempty"`
++	Network    NetworkList `json:"network,omitempty"`
+ 	OutboundTLSOptionsContainer
+ 	Multiplex      *OutboundMultiplexOptions `json:"multiplex,omitempty"`
+ 	Transport      *V2RayTransportOptions    `json:"transport,omitempty"`
+diff --git a/protocol/vless/outbound.go b/protocol/vless/outbound.go
+index 007c78f3391509180d96cfca20eadc47a4ba43d4..e634b7670cddad22ef59fa2d6ae8b6010e144095 100644
+--- a/protocol/vless/outbound.go
++++ b/protocol/vless/outbound.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/sagernet/sing-box/transport/v2ray"
+ 	"github.com/sagernet/sing-vmess/packetaddr"
+ 	"github.com/sagernet/sing-vmess/vless"
++	"github.com/sagernet/sing-vmess/vless/encryption"
+ 	"github.com/sagernet/sing/common"
+ 	"github.com/sagernet/sing/common/bufio"
+ 	E "github.com/sagernet/sing/common/exceptions"
+@@ -34,6 +35,7 @@ type Outbound struct {
+ 	logger          logger.ContextLogger
+ 	dialer          N.Dialer
+ 	client          *vless.Client
++	encryption      *encryption.ClientInstance
+ 	serverAddr      M.Socksaddr
+ 	multiplexDialer *mux.Client
+ 	tlsConfig       tls.Config
+@@ -92,6 +94,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	outbound.encryption, err = encryption.NewClient(options.Encryption)
++	if err != nil {
++		return nil, err
++	}
+ 	outbound.multiplexDialer, err = mux.NewClientWithOptions((*vlessDialer)(outbound), logger, common.PtrValueOrDefault(options.Multiplex))
+ 	if err != nil {
+ 		return nil, err
+@@ -164,6 +170,12 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	encryptedConn, err := h.applyEncryption(conn)
++	if err != nil {
++		common.Close(conn)
++		return nil, err
++	}
++	conn = encryptedConn
+ 	switch N.NetworkName(network) {
+ 	case N.NetworkTCP:
+ 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
+@@ -207,6 +219,12 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
+ 		common.Close(conn)
+ 		return nil, err
+ 	}
++	encryptedConn, err := h.applyEncryption(conn)
++	if err != nil {
++		common.Close(conn)
++		return nil, err
++	}
++	conn = encryptedConn
+ 	if h.xudp {
+ 		return h.client.DialEarlyXUDPPacketConn(conn, destination)
+ 	} else if h.packetAddr {
+@@ -222,3 +240,10 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
+ 		return h.client.DialEarlyPacketConn(conn, destination)
+ 	}
+ }
++
++func (h *vlessDialer) applyEncryption(conn net.Conn) (net.Conn, error) {
++	if h.encryption == nil {
++		return conn, nil
++	}
++	return h.encryption.Handshake(conn)
++}
