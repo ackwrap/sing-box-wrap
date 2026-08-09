@@ -6,7 +6,7 @@ icon: material/new-box
 
 !!! quote "sing-box 1.14.0 中的更改"
 
-    :material-alert: [route](#route)
+    :material-alert: [route](#route)  
     :material-plus: [sniff](#sniff)
 
 !!! quote "sing-box 1.13.0 中的更改"

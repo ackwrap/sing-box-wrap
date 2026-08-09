@@ -6,7 +6,7 @@ icon: material/new-box
 
 !!! quote "Changes in sing-box 1.14.0"
 
-    :material-alert: [route](#route)
+    :material-alert: [route](#route)  
     :material-plus: [sniff](#sniff)
 
 !!! quote "Changes in sing-box 1.13.0"
