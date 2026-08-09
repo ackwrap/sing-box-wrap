@@ -46,6 +46,9 @@ jobs:
   build:
     name: Build binary
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .work/sing-box
     needs:
       - calculate_version
     strategy:
@@ -64,6 +67,10 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
           fetch-depth: 0
+          submodules: true
+      - name: Prepare patched source
+        working-directory: ${{ github.workspace }}
+        run: python scripts/prepare_core.py --output .work/sing-box
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -95,7 +102,7 @@ jobs:
             ~/cronet-go/naiveproxy/src/gn/out/
             ~/cronet-go/naiveproxy/src/chrome/build/pgo_profiles/
             ~/cronet-go/naiveproxy/src/out/sysroot-build/
-          key: chromium-toolchain-${{ matrix.arch }}-${{ matrix.variant }}-${{ hashFiles('.github/CRONET_GO_VERSION') }}
+          key: chromium-toolchain-${{ matrix.arch }}-${{ matrix.variant }}-${{ hashFiles('.work/sing-box/.github/CRONET_GO_VERSION') }}
       - name: Download Chromium toolchain
         if: matrix.naive
         run: |
@@ -117,6 +124,7 @@ jobs:
             go run ./cmd/build-naive --target=linux/${{ matrix.arch }} env >> $GITHUB_ENV
           fi
       - name: Set tag
+        working-directory: ${{ github.workspace }}
         run: |-
           git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
           git tag v${{ needs.calculate_version.outputs.version }} -f
@@ -155,7 +163,7 @@ jobs:
         run: |
           cd ~/cronet-go
           CGO_ENABLED=0 go build -v -o "$RUNNER_TEMP/build-naive" ./cmd/build-naive
-          GOPROXY=direct GOSUMDB=off "$RUNNER_TEMP/build-naive" extract-lib --target ${{ matrix.os }}/${{ matrix.arch }} -o $GITHUB_WORKSPACE/dist
+          GOPROXY=direct GOSUMDB=off "$RUNNER_TEMP/build-naive" extract-lib --target ${{ matrix.os }}/${{ matrix.arch }} -o $GITHUB_WORKSPACE/.work/sing-box/dist
       - name: Build (glibc)
         if: matrix.variant == 'glibc'
         run: |
@@ -247,10 +255,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.os }}_${{ matrix.arch }}${{ matrix.variant && format('-{0}', matrix.variant) }}
-          path: "dist"
+          path: ".work/sing-box/dist"
   build_darwin:
     name: Build Darwin binaries
     runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: .work/sing-box
     needs:
       - calculate_version
     strategy:
@@ -262,11 +273,16 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
           fetch-depth: 0
+          submodules: true
+      - name: Prepare patched source
+        working-directory: ${{ github.workspace }}
+        run: python scripts/prepare_core.py --output .work/sing-box
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: ^1.25.3
       - name: Set tag
+        working-directory: ${{ github.workspace }}
         run: |-
           git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$GITHUB_ENV"
           git tag v${{ needs.calculate_version.outputs.version }} -f
@@ -309,10 +325,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: binary-darwin_${{ matrix.arch }}
-          path: "dist"
+          path: ".work/sing-box/dist"
   build_windows:
     name: Build Windows binaries
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: .work/sing-box
     needs:
       - calculate_version
     strategy:
@@ -325,11 +344,16 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
         with:
           fetch-depth: 0
+          submodules: true
+      - name: Prepare patched source
+        working-directory: ${{ github.workspace }}
+        run: python scripts/prepare_core.py --output .work/sing-box
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: ^1.25.4
       - name: Set tag
+        working-directory: ${{ github.workspace }}
         run: |-
           git ls-remote --exit-code --tags origin v${{ needs.calculate_version.outputs.version }} || echo "PUBLISHED=false" >> "$env:GITHUB_ENV"
           git tag v${{ needs.calculate_version.outputs.version }} -f
@@ -403,7 +427,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: binary-windows_${{ matrix.arch }}
-          path: "dist"
+          path: ".work/sing-box/dist"
   upload:
     name: Upload builds
     if: "!failure()"
