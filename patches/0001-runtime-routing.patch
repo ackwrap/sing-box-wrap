@@ -120,21 +120,17 @@ index 1de092b1ebf6b45b4167cbc9e2153c95c2520181..e63e48b0ddc89bcc8bce28a5daa21a8a
  
  const (
 diff --git a/route/route.go b/route/route.go
-index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab9dee7573 100644
+index 3d0d5f7787528058d7a2d0da9a976cd659778711..01c42565eb39bf8e593a37c6d76042d3cc4754f8 100644
 --- a/route/route.go
 +++ b/route/route.go
-@@ -105,12 +105,56 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+@@ -105,12 +105,48 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
  	if deadline.NeedAdditionalReadDeadline(conn) {
  		conn = deadline.NewConn(conn)
  	}
 -	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, conn, nil)
 +	runtimeSnapshot := r.runtimeRouting.Load()
-+	metadataPrepared := false
-+	if r.shouldPrepareRuntimeMetadata(metadata.Inbound, runtimeSnapshot) {
-+		if err := r.prepareMatchMetadata(ctx, &metadata); err != nil {
-+			return err
-+		}
-+		metadataPrepared = true
++	if err := r.prepareMatchMetadata(ctx, &metadata); err != nil {
++		return err
 +	}
 +	selectedOutbound, runtimeRoute, err := r.runtimeLeaseOutboundForSnapshot(metadata, N.NetworkTCP, runtimeSnapshot)
  	if err != nil {
@@ -170,11 +166,7 @@ index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab
 +		selectedRule = nil
 +	}
 +	if !runtimeRoute && !rulesMatched {
-+		if metadataPrepared {
-+			selectedRule, _, buffers, _, err = r.matchPreparedRule(ctx, &metadata, conn, nil)
-+		} else {
-+			selectedRule, _, buffers, _, err = r.matchRule(ctx, &metadata, conn, nil)
-+		}
++		selectedRule, _, buffers, _, err = r.matchPreparedRule(ctx, &metadata, conn, nil)
 +		if err != nil {
 +			return err
 +		}
@@ -183,7 +175,7 @@ index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab
  		switch action := selectedRule.Action().(type) {
  		case *R.RuleActionRoute:
  			var loaded bool
-@@ -151,7 +195,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+@@ -151,7 +187,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
  			return nil
  		}
  	}
@@ -192,18 +184,14 @@ index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab
  		defaultOutbound := r.outbound.Default()
  		if !common.Contains(defaultOutbound.Network(), N.NetworkTCP) {
  			buf.ReleaseMulti(buffers)
-@@ -236,13 +280,57 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+@@ -236,13 +272,49 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
  	if metadata.InboundType == C.TypeTun && metadata.Protocol == C.ProtocolDNS {
  		return r.hijackDNSPacket(ctx, conn, nil, metadata, onClose)
  	}
 -	selectedRule, _, _, packetBuffers, err := r.matchRule(ctx, &metadata, nil, conn)
 +	runtimeSnapshot := r.runtimeRouting.Load()
-+	metadataPrepared := false
-+	if r.shouldPrepareRuntimeMetadata(metadata.Inbound, runtimeSnapshot) {
-+		if err := r.prepareMatchMetadata(ctx, &metadata); err != nil {
-+			return err
-+		}
-+		metadataPrepared = true
++	if err := r.prepareMatchMetadata(ctx, &metadata); err != nil {
++		return err
 +	}
 +	selectedOutbound, runtimeRoute, err := r.runtimeLeaseOutboundForSnapshot(metadata, N.NetworkUDP, runtimeSnapshot)
  	if err != nil {
@@ -238,11 +226,7 @@ index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab
 +		selectedRule = nil
 +	}
 +	if !runtimeRoute && !rulesMatched {
-+		if metadataPrepared {
-+			selectedRule, _, _, packetBuffers, err = r.matchPreparedRule(ctx, &metadata, nil, conn)
-+		} else {
-+			selectedRule, _, _, packetBuffers, err = r.matchRule(ctx, &metadata, nil, conn)
-+		}
++		selectedRule, _, _, packetBuffers, err = r.matchPreparedRule(ctx, &metadata, nil, conn)
 +		if err != nil {
 +			return err
 +		}
@@ -253,7 +237,7 @@ index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab
  		switch action := selectedRule.Action().(type) {
  		case *R.RuleActionRoute:
  			var loaded bool
-@@ -279,7 +367,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+@@ -279,7 +351,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
  			return r.hijackDNSPacket(ctx, conn, packetBuffers, metadata, onClose)
  		}
  	}
@@ -262,7 +246,7 @@ index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab
  		defaultOutbound := r.outbound.Default()
  		if !common.Contains(defaultOutbound.Network(), N.NetworkUDP) {
  			N.ReleaseMultiPacketBuffer(packetBuffers)
-@@ -305,10 +393,74 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+@@ -305,10 +377,66 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
  	return nil
  }
  
@@ -315,14 +299,6 @@ index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab
 +	return outbound, true, err
 +}
 +
-+func (r *Router) shouldPrepareRuntimeMetadata(inboundTag string, snapshot *compiledRuntimeRouting) bool {
-+	if snapshot != nil && (len(snapshot.leases) > 0 || len(snapshot.routes) > 0) {
-+		return true
-+	}
-+	_, runtimeInbound := r.runtimeInboundOutbound(inboundTag)
-+	return !runtimeInbound
-+}
-+
  func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) adapter.PreMatchResult {
  	ctx := log.ContextWithNewID(r.ctx)
  	metadata.PreMatch = true
@@ -337,7 +313,7 @@ index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab
  	packetDestination := metadata.Destination
  	err := r.prepareMatchMetadata(ctx, &metadata)
  	if err != nil {
-@@ -570,7 +722,6 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
+@@ -570,7 +698,6 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
  	}
  	return nil
  }
@@ -345,7 +321,7 @@ index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab
  func (r *Router) matchRule(
  	ctx context.Context, metadata *adapter.InboundContext,
  	inputConn net.Conn, inputPacketConn N.PacketConn,
-@@ -582,7 +733,16 @@ func (r *Router) matchRule(
+@@ -582,7 +709,16 @@ func (r *Router) matchRule(
  	if fatalErr != nil {
  		return
  	}
@@ -362,7 +338,7 @@ index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab
  match:
  	for currentRuleIndex, currentRule := range r.rules {
  		metadata.ResetRuleCache()
-@@ -607,46 +767,7 @@ match:
+@@ -607,46 +743,7 @@ match:
  			}
  		}
  		if routeOptions != nil {
@@ -410,7 +386,7 @@ index 3d0d5f7787528058d7a2d0da9a976cd659778711..5127ec960d16f4dec74a7aa9c3d1c1ab
  		}
  		switch action := currentRule.Action().(type) {
  		case *R.RuleActionSniff:
-@@ -687,6 +808,49 @@ match:
+@@ -687,6 +784,49 @@ match:
  	return
  }
  

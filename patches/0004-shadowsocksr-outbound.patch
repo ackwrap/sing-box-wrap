@@ -1264,10 +1264,10 @@ index 0000000000000000000000000000000000000000..aaee155bc5076cdd206c407e8cb663de
 +}
 diff --git a/transport/clashssr/protocol/auth_aes128_sha1.go b/transport/clashssr/protocol/auth_aes128_sha1.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..788417df296d4760bb3eb987922293dd0cdd5278
+index 0000000000000000000000000000000000000000..64bd9675e5377fd50260d7447b5ec525200eb041
 --- /dev/null
 +++ b/transport/clashssr/protocol/auth_aes128_sha1.go
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,282 @@
 +package protocol
 +
 +import (
@@ -1395,6 +1395,11 @@ index 0000000000000000000000000000000000000000..788417df296d4760bb3eb987922293dd
 +			pos += 4
 +		} else {
 +			pos = int(binary.LittleEndian.Uint16(src.Bytes()[5:7])) + 4
++		}
++		if pos > length-4 {
++			a.rawTrans = true
++			src.Reset()
++			return errAuthAES128LengthError
 +		}
 +		dst.Write(src.Bytes()[pos : length-4])
 +		src.Next(length)
@@ -1547,10 +1552,10 @@ index 0000000000000000000000000000000000000000..788417df296d4760bb3eb987922293dd
 +}
 diff --git a/transport/clashssr/protocol/auth_chain_a.go b/transport/clashssr/protocol/auth_chain_a.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..5f1b5dc6c920c5e515fee30e6a62711f843333fa
+index 0000000000000000000000000000000000000000..66fb6e90cc90d3aea9cfc5dbb8366a6069a2ad2a
 --- /dev/null
 +++ b/transport/clashssr/protocol/auth_chain_a.go
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,324 @@
 +package protocol
 +
 +import (
@@ -1681,6 +1686,11 @@ index 0000000000000000000000000000000000000000..5f1b5dc6c920c5e515fee30e6a62711f
 +		if dataLength > 0 && randDataLength > 0 {
 +			pos += getRandStartPos(randDataLength, &a.randomServer)
 +		}
++		if pos > length+2 || dataLength > length+2-pos || (a.recvID == 1 && dataLength < 2) {
++			a.rawTrans = true
++			src.Reset()
++			return errAuthChainLengthError
++		}
 +		wantedData := src.Bytes()[pos : pos+dataLength]
 +		a.decrypter.XORKeyStream(wantedData, wantedData)
 +		if a.recvID == 1 {
@@ -1753,9 +1763,11 @@ index 0000000000000000000000000000000000000000..5f1b5dc6c920c5e515fee30e6a62711f
 +	if err != nil {
 +		return err
 +	}
-+	rc4Cipher.XORKeyStream(b, b)
++	encryptedData := pool.Get(len(b))
++	defer pool.Put(encryptedData)
++	rc4Cipher.XORKeyStream(encryptedData, b)
 +
-+	buf.Write(b)
++	buf.Write(encryptedData)
 +	tools.AppendRandBytes(buf, randDataLength)
 +	buf.Write(authData)
 +	binary.Write(buf, binary.LittleEndian, binary.LittleEndian.Uint32(a.userID[:])^binary.LittleEndian.Uint32(md5Data[:4]))
@@ -1799,7 +1811,9 @@ index 0000000000000000000000000000000000000000..5f1b5dc6c920c5e515fee30e6a62711f
 +}
 +
 +func (a *authChainA) packData(poolBuf *bytes.Buffer, data []byte) {
-+	a.encrypter.XORKeyStream(data, data)
++	encryptedData := pool.Get(len(data))
++	defer pool.Put(encryptedData)
++	a.encrypter.XORKeyStream(encryptedData, data)
 +
 +	macKey := pool.Get(len(a.userKey) + 4)
 +	defer pool.Put(macKey)
@@ -1807,11 +1821,11 @@ index 0000000000000000000000000000000000000000..5f1b5dc6c920c5e515fee30e6a62711f
 +	binary.LittleEndian.PutUint32(macKey[len(a.userKey):], a.packID)
 +	a.packID++
 +
-+	length := uint16(len(data)) ^ binary.LittleEndian.Uint16(a.lastClientHash[14:16])
++	length := uint16(len(encryptedData)) ^ binary.LittleEndian.Uint16(a.lastClientHash[14:16])
 +
 +	originalLength := poolBuf.Len()
 +	binary.Write(poolBuf, binary.LittleEndian, length)
-+	a.putMixedRandDataAndData(poolBuf, data)
++	a.putMixedRandDataAndData(poolBuf, encryptedData)
 +	a.lastClientHash = tools.HmacMD5(macKey, poolBuf.Bytes()[originalLength:])
 +	poolBuf.Write(a.lastClientHash[:2])
 +}
@@ -1971,10 +1985,10 @@ index 0000000000000000000000000000000000000000..0e3176008fa5dc4dc3224896e239ed48
 +}
 diff --git a/transport/clashssr/protocol/auth_sha1_v4.go b/transport/clashssr/protocol/auth_sha1_v4.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..ee472d743b31f95d19ecfed588e9c11bfbbc23ce
+index 0000000000000000000000000000000000000000..db5d35ca546cc7990fcc5c906a6ae5c18ed087d6
 --- /dev/null
 +++ b/transport/clashssr/protocol/auth_sha1_v4.go
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,187 @@
 +package protocol
 +
 +import (
@@ -2047,6 +2061,11 @@ index 0000000000000000000000000000000000000000..ee472d743b31f95d19ecfed588e9c11b
 +			pos += 4
 +		} else {
 +			pos = int(binary.BigEndian.Uint16(src.Bytes()[5:7])) + 4
++		}
++		if pos > length-4 {
++			a.rawTrans = true
++			src.Reset()
++			return errAuthSHA1V4LengthError
 +		}
 +		dst.Write(src.Bytes()[pos : length-4])
 +		src.Next(length)
