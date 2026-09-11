@@ -20,4 +20,3 @@ Patch groups:
 3. Full certificate SHA-256 pinning across supported TLS engines.
 4. ShadowsocksR outbound support.
 5. VLESS encryption and the Ackwrap sing-vmess dependency.
-6. Atomic OOM draft throttling on Darwin.
