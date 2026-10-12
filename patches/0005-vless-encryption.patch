@@ -1,38 +1,38 @@
 diff --git a/go.mod b/go.mod
-index d0ad36eec860c93f883a7de8ae79e71396ec03b0..fcfe149ea827250cd2c4628900b61113d1c20499 100644
+index 53b8a1cae5cb32ad5f362310c6570f37c47bda0a..8731a413e708173049549c2c841391877f1f78e5 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -82,6 +82,8 @@ require (
  	howett.net/plist v1.0.1
  )
  
-+replace github.com/sagernet/sing-vmess => github.com/ackwrap/sing-vmess v0.2.8-ackwrap.1
++replace github.com/sagernet/sing-vmess => github.com/ackwrap/sing-vmess v0.2.8-ackwrap.1.0.20261012034339-303ff56b4249
 +
  require (
  	filippo.io/edwards25519 v1.2.0 // indirect
  	filippo.io/hpke v0.4.0 // indirect
 diff --git a/go.sum b/go.sum
-index b56ed351c081b920a66ae256658d6ba130212245..fcf047a12b7385aa248b2575c73a39684fcabf76 100644
+index ed70f5876f1649dff8b4702eccb51cd7a31ec2f8..13418bb349d4653348e0da4c0ab12478e330a554 100644
 --- a/go.sum
 +++ b/go.sum
 @@ -14,6 +14,8 @@ github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp
  github.com/RyuaNerin/go-krypto v1.3.0/go.mod h1:9R9TU936laAIqAmjcHo/LsaXYOZlymudOAxjaBf62UM=
  github.com/RyuaNerin/testingutil v0.1.0 h1:IYT6JL57RV3U2ml3dLHZsVtPOP6yNK7WUVdzzlpNrss=
  github.com/RyuaNerin/testingutil v0.1.0/go.mod h1:yTqj6Ta/ycHMPJHRyO12Mz3VrvTloWOsy23WOZH19AA=
-+github.com/ackwrap/sing-vmess v0.2.8-ackwrap.1 h1:FNLoCNGS0pw0zaNEb+T1xsfq4Ly+W6ev5NKyun2pwlU=
-+github.com/ackwrap/sing-vmess v0.2.8-ackwrap.1/go.mod h1:R3IXQ2AqCmWvbt5O3H2m/J358EojW7U1t9FrDmeMcPI=
++github.com/ackwrap/sing-vmess v0.2.8-ackwrap.1.0.20261012034339-303ff56b4249 h1:Nfj0T25GKtkwQCpQNLE3+SvX0xe8tTcaUo2qRnZ/XkU=
++github.com/ackwrap/sing-vmess v0.2.8-ackwrap.1.0.20261012034339-303ff56b4249/go.mod h1:R3IXQ2AqCmWvbt5O3H2m/J358EojW7U1t9FrDmeMcPI=
  github.com/ajg/form v1.5.1 h1:t9c7v8JUKu/XxOGBU0yjNpaMloxGEJhUkqFRq0ibGeU=
  github.com/ajg/form v1.5.1/go.mod h1:uL1WgH+h2mgNtvBq0339dVnzXdBETtL2LeUXaIv25UY=
  github.com/akutz/memconn v0.1.0 h1:NawI0TORU4hcOMsMr11g7vwlCdkYeLKXBcxWu2W/P8A=
-@@ -342,8 +344,6 @@ github.com/sagernet/sing-tun v0.9.4-0.20260910071410-6655bc286d05 h1:z/xTcoUfCn4
- github.com/sagernet/sing-tun v0.9.4-0.20260910071410-6655bc286d05/go.mod h1:kCw7pD7VnxuTsoEyU7uSI1b01w1rbyuUJKYqwlR9qtc=
+@@ -342,8 +344,6 @@ github.com/sagernet/sing-tun v0.9.7-0.20261009020158-bca4bf029237 h1:B9tUcRf1FAa
+ github.com/sagernet/sing-tun v0.9.7-0.20261009020158-bca4bf029237/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
  github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca h1:5wA+IE0Fq1CGVLOgSpm0gKKZ03HzugcJ2JyhmDqeX6A=
  github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca/go.mod h1:ADAZZU85MnM91XNhd2TdZRTaIbA7RjTZuQ1KCHcUbNg=
--github.com/sagernet/sing-vmess v0.2.8 h1:xd5nnDOMlC76RgrLksS4jlk3eMt3c3CvQY3NsjWPWeI=
--github.com/sagernet/sing-vmess v0.2.8/go.mod h1:P11scgTxMxVVQ8dlM27yNm3Cro40mD0+gHbnqrNGDuY=
+-github.com/sagernet/sing-vmess v0.2.9-0.20260929152519-9b95ab8c9478 h1:q2eQn4nq8oWGxRm9zXesXSlPr9GEgPrOGzf4iPtzG9A=
+-github.com/sagernet/sing-vmess v0.2.9-0.20260929152519-9b95ab8c9478/go.mod h1:P11scgTxMxVVQ8dlM27yNm3Cro40mD0+gHbnqrNGDuY=
  github.com/sagernet/smux v1.5.50-sing-box-mod.1 h1:XkJcivBC9V4wBjiGXIXZ229aZCU1hzcbp6kSkkyQ478=
  github.com/sagernet/smux v1.5.50-sing-box-mod.1/go.mod h1:NjhsCEWedJm7eFLyhuBgIEzwfhRmytrUoiLluxs5Sk8=
- github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.4 h1:b8rLu1OcWPBEtfwPmCI+jOHrMcVEnZODY63/lirNSYc=
+ github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5 h1:mGLWVgj2Pl2NlgE1+sEUIDIMB42JdWEPwYmxTnVWg44=
 diff --git a/option/vless.go b/option/vless.go
 index 5acf2aeed0b38d51e16e028a2759ea6149d36336..5c65dfacff22a2bedcf6bdaba31e948e62e3009e 100644
 --- a/option/vless.go
@@ -52,7 +52,7 @@ index 5acf2aeed0b38d51e16e028a2759ea6149d36336..5c65dfacff22a2bedcf6bdaba31e948e
  	Multiplex      *OutboundMultiplexOptions `json:"multiplex,omitempty"`
  	Transport      *V2RayTransportOptions    `json:"transport,omitempty"`
 diff --git a/protocol/vless/outbound.go b/protocol/vless/outbound.go
-index f837ac04ab69d37ae5230e442ec69e0bb27bac92..21f28c1a8865769895062c9bf8278519bc376271 100644
+index c0ece0a2d831a879a52129cebab6db8e9b7d1784..ad82b8e4c58bf26d973e9b1c7ee689da191d7cd3 100644
 --- a/protocol/vless/outbound.go
 +++ b/protocol/vless/outbound.go
 @@ -15,6 +15,7 @@ import (
@@ -82,7 +82,7 @@ index f837ac04ab69d37ae5230e442ec69e0bb27bac92..21f28c1a8865769895062c9bf8278519
  	outbound.multiplexDialer, err = mux.NewClientWithOptions((*vlessDialer)(outbound), logger, common.PtrValueOrDefault(options.Multiplex))
  	if err != nil {
  		return nil, err
-@@ -192,6 +198,12 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
+@@ -201,6 +207,12 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
  	if err != nil {
  		return nil, err
  	}
@@ -95,7 +95,7 @@ index f837ac04ab69d37ae5230e442ec69e0bb27bac92..21f28c1a8865769895062c9bf8278519
  	switch N.NetworkName(network) {
  	case N.NetworkTCP:
  		h.logger.InfoContext(ctx, "outbound connection to ", destination)
-@@ -235,6 +247,12 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
+@@ -244,6 +256,12 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
  		common.Close(conn)
  		return nil, err
  	}
@@ -108,7 +108,7 @@ index f837ac04ab69d37ae5230e442ec69e0bb27bac92..21f28c1a8865769895062c9bf8278519
  	if h.xudp {
  		return h.client.DialEarlyXUDPPacketConn(conn, destination)
  	} else if h.packetAddr {
-@@ -250,3 +268,10 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
+@@ -259,3 +277,10 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
  		return h.client.DialEarlyPacketConn(conn, destination)
  	}
  }

@@ -1,2 +1,2 @@
 repository=https://github.com/SagerNet/sing-box.git
-commit=f6ce1d5be042436d2b498d216cef718ea87a1ca8
+commit=7054cac5124465ffdb145870d7c01885566711b1
