@@ -3,3 +3,4 @@
 0003-certificate-sha256.patch
 0004-shadowsocksr-outbound.patch
 0005-vless-encryption.patch
+0006-icmp-fail-closed.patch
