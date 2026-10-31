@@ -1,8 +1,8 @@
 diff --git a/adapter/inbound.go b/adapter/inbound.go
-index b081ddc943e6665d034c1ef72fb8d9196c93e28e..363601de32deeb1ff265ccac88edbbd144a6b6d3 100644
+index 3027f1eb12d026a0ed4d4344170b9fd7b526a75c..13fc828ce552fbe2d518d2c58d3132f1d5c153c3 100644
 --- a/adapter/inbound.go
 +++ b/adapter/inbound.go
-@@ -43,6 +43,14 @@ type InboundManager interface {
+@@ -44,6 +44,14 @@ type InboundManager interface {
  	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, inboundType string, options any) error
  }
  
@@ -229,10 +229,10 @@ index be6267419103562890843c7f792453f5d0a165e8..77a69089e75182830534c8ed8c631c84
  
  const (
 diff --git a/route/route.go b/route/route.go
-index 8dddb0431750c648962149b890cb1b9d0f0cfce1..c457046c9150bbead0d715c79d251a02c806ca01 100644
+index bf25baeee0d7441dd8bb01e34b24f140c8554202..7d1ac3d9996708c0c7718fb19bcbc96ae9bf6f22 100644
 --- a/route/route.go
 +++ b/route/route.go
-@@ -105,12 +105,48 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+@@ -107,12 +107,48 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
  	if deadline.NeedAdditionalReadDeadline(conn) {
  		conn = deadline.NewConn(conn)
  	}
@@ -284,16 +284,16 @@ index 8dddb0431750c648962149b890cb1b9d0f0cfce1..c457046c9150bbead0d715c79d251a02
  		switch action := selectedRule.Action().(type) {
  		case *R.RuleActionRoute:
  			var loaded bool
-@@ -151,7 +187,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
+@@ -145,7 +181,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
  			return nil
  		}
  	}
 -	if selectedRule == nil {
 +	if !runtimeRoute && selectedRule == nil {
- 		defaultOutbound := r.outbound.Default()
- 		if !common.Contains(defaultOutbound.Network(), N.NetworkTCP) {
- 			buf.ReleaseMulti(buffers)
-@@ -240,13 +276,49 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+ 		selectedOutbound = r.outbound.Default()
+ 	}
+ 	chain, err := resolveOutbound(selectedOutbound, N.NetworkTCP)
+@@ -275,13 +311,49 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
  	if metadata.InboundType == C.TypeTun && metadata.Protocol == C.ProtocolDNS {
  		return r.hijackDNSPacket(ctx, conn, nil, metadata, onClose)
  	}
@@ -346,16 +346,16 @@ index 8dddb0431750c648962149b890cb1b9d0f0cfce1..c457046c9150bbead0d715c79d251a02
  		switch action := selectedRule.Action().(type) {
  		case *R.RuleActionRoute:
  			var loaded bool
-@@ -283,7 +355,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+@@ -310,7 +382,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
  			return r.hijackDNSPacket(ctx, conn, packetBuffers, metadata, onClose)
  		}
  	}
 -	if selectedRule == nil || selectReturn {
 +	if !runtimeRoute && (selectedRule == nil || selectReturn) {
- 		defaultOutbound := r.outbound.Default()
- 		if !common.Contains(defaultOutbound.Network(), N.NetworkUDP) {
- 			N.ReleaseMultiPacketBuffer(packetBuffers)
-@@ -313,10 +385,66 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
+ 		selectedOutbound = r.outbound.Default()
+ 	}
+ 	chain, err := resolveOutbound(selectedOutbound, N.NetworkUDP)
+@@ -344,10 +416,66 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
  	return nil
  }
  
@@ -368,8 +368,8 @@ index 8dddb0431750c648962149b890cb1b9d0f0cfce1..c457046c9150bbead0d715c79d251a02
 +	if !loaded {
 +		return nil, true, E.New("runtime outbound not found: ", outboundTag)
 +	}
-+	if !common.Contains(outbound.Network(), network) {
-+		return nil, true, E.New(network, " is not supported by runtime outbound: ", outboundTag)
++	if _, err := resolveOutbound(outbound, network); err != nil {
++		return nil, true, err
 +	}
 +	return outbound, true, nil
 +}
@@ -422,7 +422,7 @@ index 8dddb0431750c648962149b890cb1b9d0f0cfce1..c457046c9150bbead0d715c79d251a02
  	packetDestination := metadata.Destination
  	err := r.prepareMatchMetadata(ctx, &metadata)
  	if err != nil {
-@@ -589,7 +717,6 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
+@@ -616,7 +744,6 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
  	}
  	return nil
  }
@@ -430,7 +430,7 @@ index 8dddb0431750c648962149b890cb1b9d0f0cfce1..c457046c9150bbead0d715c79d251a02
  func (r *Router) matchRule(
  	ctx context.Context, metadata *adapter.InboundContext,
  	inputConn net.Conn, inputPacketConn N.PacketConn,
-@@ -601,7 +728,16 @@ func (r *Router) matchRule(
+@@ -628,7 +755,16 @@ func (r *Router) matchRule(
  	if fatalErr != nil {
  		return
  	}
@@ -447,7 +447,7 @@ index 8dddb0431750c648962149b890cb1b9d0f0cfce1..c457046c9150bbead0d715c79d251a02
  match:
  	for currentRuleIndex, currentRule := range r.rules {
  		metadata.ResetRuleCache()
-@@ -626,46 +762,7 @@ match:
+@@ -653,46 +789,7 @@ match:
  			}
  		}
  		if routeOptions != nil {
@@ -495,7 +495,7 @@ index 8dddb0431750c648962149b890cb1b9d0f0cfce1..c457046c9150bbead0d715c79d251a02
  		}
  		switch action := currentRule.Action().(type) {
  		case *R.RuleActionSniff:
-@@ -706,6 +803,49 @@ match:
+@@ -733,6 +830,49 @@ match:
  	return
  }
  
@@ -649,7 +649,7 @@ index 0673ddef87970fa293bbd0f548bc81095a748b15..81b4835e5fe8991a9c854ffc279102a1
  		err := R.ValidateNoNestedRuleActions(options)
 diff --git a/route/runtime_routing.go b/route/runtime_routing.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..f2f7973119f956494c878dbf796477e079669fea
+index 0000000000000000000000000000000000000000..297ad8ce6b45546666872e0f3f620ef448999a49
 --- /dev/null
 +++ b/route/runtime_routing.go
 @@ -0,0 +1,656 @@
@@ -1219,8 +1219,8 @@ index 0000000000000000000000000000000000000000..f2f7973119f956494c878dbf796477e0
 +	if !loaded {
 +		return nil, "runtime outbound not found: " + tag
 +	}
-+	if !common.Contains(outbound.Network(), network) {
-+		return nil, network + " is not supported by runtime outbound: " + tag
++	if _, err := resolveOutbound(outbound, network); err != nil {
++		return nil, err.Error()
 +	}
 +	return outbound, ""
 +}
