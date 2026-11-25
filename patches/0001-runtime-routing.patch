@@ -1311,10 +1311,10 @@ index 0000000000000000000000000000000000000000..297ad8ce6b45546666872e0f3f620ef4
 +}
 diff --git a/service/api/runtime_node_exposure.go b/service/api/runtime_node_exposure.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b641bd2f10b
+index 0000000000000000000000000000000000000000..bb6b0efd5ecff52ae9b713d4ee5c5630d37a4990
 --- /dev/null
 +++ b/service/api/runtime_node_exposure.go
-@@ -0,0 +1,475 @@
+@@ -0,0 +1,545 @@
 +package api
 +
 +import (
@@ -1326,6 +1326,7 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +	"io"
 +	"net/http"
 +	"net/netip"
++	"slices"
 +	"sort"
 +	"strings"
 +	"sync"
@@ -1335,8 +1336,10 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +	C "github.com/sagernet/sing-box/constant"
 +	"github.com/sagernet/sing-box/log"
 +	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/auth"
 +	E "github.com/sagernet/sing/common/exceptions"
 +	"github.com/sagernet/sing/common/json"
++	"github.com/sagernet/sing/common/json/badoption"
 +	"github.com/sagernet/sing/service"
 +)
 +
@@ -1350,7 +1353,7 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +var (
 +	errRuntimeAPIUnavailable       = errors.New("runtime API is unavailable")
 +	errRuntimeAPIConflict          = errors.New("runtime resource already exists")
-+	errRuntimeNodeExposureNotFound = errors.New("runtime node exposure not found")
++	ErrRuntimeNodeExposureNotFound = errors.New("runtime node exposure not found")
 +)
 +
 +type runtimeAPI struct {
@@ -1364,6 +1367,7 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +
 +	access    sync.Mutex
 +	exposures map[string]runtimeNodeExposure
++	started   atomic.Bool
 +	closing   atomic.Bool
 +}
 +
@@ -1417,6 +1421,71 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +	}
 +}
 +
++// NodeExposureIDs lists active listeners on this started API service.
++// The library methods are for the owner of the instance, not HTTP clients.
++func (s *Service) NodeExposureIDs(ctx context.Context) ([]string, error) {
++	a, err := s.nodeExposureAPI(ctx)
++	if err != nil {
++		return nil, err
++	}
++	active := a.list()
++	if cause := context.Cause(ctx); cause != nil {
++		return nil, cause
++	}
++	ids := make([]string, 0, len(active.Items))
++	for _, item := range active.Items {
++		ids = append(ids, item.ID)
++	}
++	return ids, nil
++}
++
++// UpsertMixedNodeExposure creates or replaces a listener using the same
++// validation, routing and rollback as the authenticated runtime HTTP API.
++func (s *Service) UpsertMixedNodeExposure(ctx context.Context, id string, listen netip.AddrPort, users []auth.User, outboundTag string) error {
++	a, err := s.nodeExposureAPI(ctx)
++	if err != nil {
++		return err
++	}
++	if !validRuntimeExposureID(id) || !listen.IsValid() {
++		return errors.New("invalid node exposure ID or listen address")
++	}
++	ip := badoption.Addr(listen.Addr())
++	exposure, err := a.prepareExposure(id, option.Inbound{
++		Type: C.TypeMixed,
++		Options: &option.HTTPMixedInboundOptions{
++			ListenOptions: option.ListenOptions{Listen: &ip, ListenPort: listen.Port()},
++			Users:         slices.Clone(users),
++		},
++	}, outboundTag)
++	if err != nil {
++		return err
++	}
++	return a.upsert(ctx, exposure)
++}
++
++// DeleteNodeExposure removes a listener and its routing entry.
++func (s *Service) DeleteNodeExposure(ctx context.Context, id string) error {
++	a, err := s.nodeExposureAPI(ctx)
++	if err != nil {
++		return err
++	}
++	if !validRuntimeExposureID(id) {
++		return ErrRuntimeNodeExposureNotFound
++	}
++	return a.delete(ctx, id)
++}
++
++func (s *Service) nodeExposureAPI(ctx context.Context) (*runtimeAPI, error) {
++	if cause := context.Cause(ctx); cause != nil {
++		return nil, cause
++	}
++	a := s.runtimeAPI
++	if a == nil || !a.started.Load() || !a.ready() || a.ctx.Err() != nil {
++		return nil, errRuntimeAPIUnavailable
++	}
++	return a, nil
++}
++
 +func (a *runtimeAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 +	if !a.authenticate(request) {
 +		writer.Header().Set("WWW-Authenticate", "Bearer")
@@ -1460,7 +1529,7 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +	case http.MethodPut:
 +		a.handlePut(writer, request, pathID)
 +	case http.MethodDelete:
-+		a.handleDelete(writer, pathID)
++		a.handleDelete(writer, request, pathID)
 +	default:
 +		writeRuntimeAPIError(writer, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 +	}
@@ -1476,12 +1545,17 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +		writeRuntimeAPIError(writer, http.StatusBadRequest, "INVALID_REQUEST", "request body is too large or unreadable")
 +		return
 +	}
-+	exposure, err := a.parseExposure(id, content)
++	params, err := json.UnmarshalExtendedContext[runtimeNodeExposureRequest](a.ctx, content)
++	if err != nil {
++		writeRuntimeAPIError(writer, http.StatusBadRequest, "INVALID_REQUEST", E.Cause(err, "decode node exposure").Error())
++		return
++	}
++	exposure, err := a.prepareExposure(id, params.Inbound, params.OutboundTag)
 +	if err != nil {
 +		writeRuntimeAPIError(writer, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
 +		return
 +	}
-+	err = a.upsert(exposure)
++	err = a.upsert(request.Context(), exposure)
 +	if err != nil {
 +		if errors.Is(err, errRuntimeAPIUnavailable) {
 +			writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
@@ -1497,17 +1571,17 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +	writeRuntimeAPIJSON(writer, http.StatusOK, exposure.summary())
 +}
 +
-+func (a *runtimeAPI) handleDelete(writer http.ResponseWriter, id string) {
++func (a *runtimeAPI) handleDelete(writer http.ResponseWriter, request *http.Request, id string) {
 +	if !a.ready() {
 +		writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
 +		return
 +	}
-+	err := a.delete(id)
++	err := a.delete(request.Context(), id)
 +	if errors.Is(err, errRuntimeAPIUnavailable) {
 +		writeRuntimeAPIError(writer, http.StatusServiceUnavailable, "RUNTIME_UNAVAILABLE", errRuntimeAPIUnavailable.Error())
 +		return
 +	}
-+	if errors.Is(err, errRuntimeNodeExposureNotFound) {
++	if errors.Is(err, ErrRuntimeNodeExposureNotFound) {
 +		writeRuntimeAPIError(writer, http.StatusNotFound, "NOT_FOUND", "node exposure not found")
 +		return
 +	}
@@ -1533,21 +1607,17 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +	return subtle.ConstantTimeCompare([]byte(token), []byte(a.secret)) == 1
 +}
 +
-+func (a *runtimeAPI) parseExposure(id string, content []byte) (runtimeNodeExposure, error) {
-+	request, err := json.UnmarshalExtendedContext[runtimeNodeExposureRequest](a.ctx, content)
-+	if err != nil {
-+		return runtimeNodeExposure{}, E.Cause(err, "decode node exposure")
-+	}
-+	request.OutboundTag = strings.TrimSpace(request.OutboundTag)
-+	if request.OutboundTag == "" {
++func (a *runtimeAPI) prepareExposure(id string, inbound option.Inbound, outboundTag string) (runtimeNodeExposure, error) {
++	outboundTag = strings.TrimSpace(outboundTag)
++	if outboundTag == "" {
 +		return runtimeNodeExposure{}, errors.New("missing outbound_tag")
 +	}
-+	switch request.Inbound.Type {
++	switch inbound.Type {
 +	case C.TypeHTTP, C.TypeSOCKS, C.TypeMixed:
 +	default:
-+		return runtimeNodeExposure{}, E.New("unsupported inbound type: ", request.Inbound.Type)
++		return runtimeNodeExposure{}, E.New("unsupported inbound type: ", inbound.Type)
 +	}
-+	listenWrapper, loaded := request.Inbound.Options.(option.ListenOptionsWrapper)
++	listenWrapper, loaded := inbound.Options.(option.ListenOptionsWrapper)
 +	if !loaded {
 +		return runtimeNodeExposure{}, errors.New("inbound does not support listen options")
 +	}
@@ -1558,22 +1628,22 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +	if listenOptions.Detour != "" {
 +		return runtimeNodeExposure{}, errors.New("inbound detour is not supported")
 +	}
-+	users, setSystemProxy := runtimeInboundSecurity(request.Inbound.Options)
++	users, setSystemProxy := runtimeInboundSecurity(inbound.Options)
 +	if setSystemProxy {
 +		return runtimeNodeExposure{}, errors.New("set_system_proxy is not supported")
 +	}
 +	if users == 0 && (listenOptions.Listen == nil || !netip.Addr(*listenOptions.Listen).IsLoopback()) {
 +		return runtimeNodeExposure{}, errors.New("authentication is required for non-loopback listeners")
 +	}
-+	request.Inbound.Tag = runtimeNodeExposureTagPrefix + "in-" + id
-+	targetOutbound, loaded := a.outboundManager.Outbound(request.OutboundTag)
++	inbound.Tag = runtimeNodeExposureTagPrefix + "in-" + id
++	targetOutbound, loaded := a.outboundManager.Outbound(outboundTag)
 +	if !loaded {
-+		return runtimeNodeExposure{}, E.New("outbound not found: ", request.OutboundTag)
++		return runtimeNodeExposure{}, E.New("outbound not found: ", outboundTag)
 +	}
 +	return runtimeNodeExposure{
 +		ID:           id,
-+		Inbound:      request.Inbound,
-+		OutboundTag:  request.OutboundTag,
++		Inbound:      inbound,
++		OutboundTag:  outboundTag,
 +		OutboundType: targetOutbound.Type(),
 +	}, nil
 +}
@@ -1618,14 +1688,14 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +	return runtimeNodeExposureList{Items: items}
 +}
 +
-+func (a *runtimeAPI) upsert(exposure runtimeNodeExposure) error {
-+	if a.closing.Load() {
-+		return errRuntimeAPIUnavailable
-+	}
++func (a *runtimeAPI) upsert(ctx context.Context, exposure runtimeNodeExposure) error {
 +	a.access.Lock()
 +	defer a.access.Unlock()
 +	if a.closing.Load() {
 +		return errRuntimeAPIUnavailable
++	}
++	if cause := context.Cause(ctx); cause != nil {
++		return cause
 +	}
 +	existing, loaded := a.exposures[exposure.ID]
 +	if loaded {
@@ -1676,18 +1746,18 @@ index 0000000000000000000000000000000000000000..7ab3bda5ea7176fca0427234f5148b64
 +	return nil
 +}
 +
-+func (a *runtimeAPI) delete(id string) error {
-+	if a.closing.Load() {
-+		return errRuntimeAPIUnavailable
-+	}
++func (a *runtimeAPI) delete(ctx context.Context, id string) error {
 +	a.access.Lock()
 +	defer a.access.Unlock()
 +	if a.closing.Load() {
 +		return errRuntimeAPIUnavailable
 +	}
++	if cause := context.Cause(ctx); cause != nil {
++		return cause
++	}
 +	existing, loaded := a.exposures[id]
 +	if !loaded {
-+		return errRuntimeNodeExposureNotFound
++		return ErrRuntimeNodeExposureNotFound
 +	}
 +	if !existing.Active {
 +		if err := a.cleanupInactiveLocked(existing); err != nil {
@@ -1980,7 +2050,7 @@ index 0000000000000000000000000000000000000000..db7dab743e1ca764f59d6dd68632223f
 +	return a.runtimeRouter.RuntimeAccessEvents(after, limit), nil
 +}
 diff --git a/service/api/server.go b/service/api/server.go
-index 87af96446be47f7e43ab40b33f5c66a65ae5deaf..1a21c000eeec6800ca979b934ae162b9efd509b2 100644
+index 87af96446be47f7e43ab40b33f5c66a65ae5deaf..eae43d29417ea63a902f76935e3db1063b7c4b2d 100644
 --- a/service/api/server.go
 +++ b/service/api/server.go
 @@ -28,11 +28,12 @@ func RegisterService(registry *boxService.Registry) {
@@ -2030,6 +2100,16 @@ index 87af96446be47f7e43ab40b33f5c66a65ae5deaf..1a21c000eeec6800ca979b934ae162b9
  		BaseContext: func(net.Listener) context.Context {
  			return ctx
  		},
+@@ -111,6 +118,9 @@ func (s *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+ 		tcpListener = aTLS.NewListener(tcpListener, s.tlsConfig)
+ 	}
+ 	scope.Add(httpServer.Close)
++	if s.runtimeAPI != nil {
++		s.runtimeAPI.started.Store(true)
++	}
+ 	go func() {
+ 		serveErr := httpServer.Serve(tcpListener)
+ 		if serveErr != nil && ctx.Err() == nil {
 diff --git a/service/api/web_bridge.go b/service/api/web_bridge.go
 index 39c2568743dd8db425e3197182b6caec5ac70c0f..1e81583f617eb2fee4284db7e2690d699b81ccf0 100644
 --- a/service/api/web_bridge.go

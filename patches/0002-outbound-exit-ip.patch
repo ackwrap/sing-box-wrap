@@ -9,10 +9,10 @@ index 0000000000000000000000000000000000000000..1bc53ebea7f7eafb17a077e7bf9fea03
 +* Add a loopback-only Clash API endpoint at `GET /proxies/{name}/exit-ip?ip_version=4|6` for Ackwrap. The endpoint reuses configured Clash API authentication, requests a fixed Cloudflare Trace address directly through the named outbound, and does not change selector state.
 diff --git a/experimental/clashapi/exitip.go b/experimental/clashapi/exitip.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..55fcc5190c81a60173b6846d0239ce2e4325b402
+index 0000000000000000000000000000000000000000..6a54aa284166d3775c0138a82ff0ccfcf0e7d67f
 --- /dev/null
 +++ b/experimental/clashapi/exitip.go
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,284 @@
 +package clashapi
 +
 +import (
@@ -66,21 +66,18 @@ index 0000000000000000000000000000000000000000..55fcc5190c81a60173b6846d0239ce2e
 +		}
 +
 +		proxy := request.Context().Value(CtxKeyProxy).(adapter.Outbound)
-+		ctx, cancel := context.WithTimeout(request.Context(), outboundExitIPTimeout)
-+		defer cancel()
 +		server.logger.Info("outbound exit IP check started: ", proxy.Tag())
-+		ip, err := lookupOutboundExitIP(ctx, proxy, ipv6)
-+		if err != nil {
-+			description := describeOutboundExitIPError(ctx, err)
-+			server.logger.Warn("outbound exit IP check failed stage=", description.stage, " reason=", description.reason, ": ", proxy.Tag())
++		ip, failure := ProbeOutboundExitIP(request.Context(), proxy, ipv6)
++		if failure != nil {
++			server.logger.Warn("outbound exit IP check failed stage=", failure.Stage, " reason=", failure.Reason, ": ", proxy.Tag())
 +			payload := render.M{
-+				"stage":  description.stage,
-+				"reason": description.reason,
++				"stage":  failure.Stage,
++				"reason": failure.Reason,
 +			}
-+			if description.upstreamStatus > 0 {
-+				payload["upstream_status"] = description.upstreamStatus
++			if failure.UpstreamStatus > 0 {
++				payload["upstream_status"] = failure.UpstreamStatus
 +			}
-+			render.Status(request, description.status)
++			render.Status(request, failure.Status)
 +			render.JSON(writer, request, payload)
 +			return
 +		}
@@ -110,17 +107,32 @@ index 0000000000000000000000000000000000000000..55fcc5190c81a60173b6846d0239ce2e
 +	return &outboundExitIPStageError{stage: stage, err: err}
 +}
 +
-+type outboundExitIPErrorDescription struct {
-+	stage          string
-+	reason         string
-+	status         int
-+	upstreamStatus int
++// OutboundExitIPFailure describes a probe failure without leaking raw
++// transport errors or outbound credentials.
++type OutboundExitIPFailure struct {
++	Stage          string
++	Reason         string
++	Status         int // status used by the Clash HTTP API
++	UpstreamStatus int
 +}
 +
-+func describeOutboundExitIPError(ctx context.Context, err error) outboundExitIPErrorDescription {
++// ProbeOutboundExitIP sends the fixed probe through this outbound only.
++// It never changes a selector or falls back to a direct connection.
++func ProbeOutboundExitIP(ctx context.Context, outbound adapter.Outbound, ipv6 bool) (net.IP, *OutboundExitIPFailure) {
++	ctx, cancel := context.WithTimeout(ctx, outboundExitIPTimeout)
++	defer cancel()
++	ip, err := lookupOutboundExitIP(ctx, outbound, ipv6)
++	if err != nil {
++		failure := describeOutboundExitIPError(ctx, err)
++		return nil, &failure
++	}
++	return ip, nil
++}
++
++func describeOutboundExitIPError(ctx context.Context, err error) OutboundExitIPFailure {
 +	if isOutboundExitIPTimeout(ctx, err) {
-+		return outboundExitIPErrorDescription{
-+			stage: "timeout", reason: "timeout", status: http.StatusGatewayTimeout,
++		return OutboundExitIPFailure{
++			Stage: "timeout", Reason: "timeout", Status: http.StatusGatewayTimeout,
 +		}
 +	}
 +	stage := "outbound_connect"
@@ -130,32 +142,32 @@ index 0000000000000000000000000000000000000000..55fcc5190c81a60173b6846d0239ce2e
 +	}
 +	switch stage {
 +	case "http_status":
-+		description := outboundExitIPErrorDescription{
-+			stage: stage, reason: "upstream_http_status", status: http.StatusBadGateway,
++		description := OutboundExitIPFailure{
++			Stage: stage, Reason: "upstream_http_status", Status: http.StatusBadGateway,
 +		}
 +		if stageError != nil {
-+			description.upstreamStatus = stageError.upstreamStatus
++			description.UpstreamStatus = stageError.upstreamStatus
 +		}
 +		return description
 +	case "read_response":
-+		return outboundExitIPErrorDescription{
-+			stage: stage, reason: "read_response", status: http.StatusBadGateway,
++		return OutboundExitIPFailure{
++			Stage: stage, Reason: "read_response", Status: http.StatusBadGateway,
 +		}
 +	case "response_too_large":
-+		return outboundExitIPErrorDescription{
-+			stage: stage, reason: "response_too_large", status: http.StatusBadGateway,
++		return OutboundExitIPFailure{
++			Stage: stage, Reason: "response_too_large", Status: http.StatusBadGateway,
 +		}
 +	case "invalid_response":
-+		return outboundExitIPErrorDescription{
-+			stage: stage, reason: "invalid_response", status: http.StatusBadGateway,
++		return OutboundExitIPFailure{
++			Stage: stage, Reason: "invalid_response", Status: http.StatusBadGateway,
 +		}
 +	case "address_family":
-+		return outboundExitIPErrorDescription{
-+			stage: stage, reason: "address_family", status: http.StatusBadGateway,
++		return OutboundExitIPFailure{
++			Stage: stage, Reason: "address_family", Status: http.StatusBadGateway,
 +		}
 +	default:
-+		return outboundExitIPErrorDescription{
-+			stage: "outbound_connect", reason: classifyOutboundConnectError(err), status: http.StatusBadGateway,
++		return OutboundExitIPFailure{
++			Stage: "outbound_connect", Reason: classifyOutboundConnectError(err), Status: http.StatusBadGateway,
 +		}
 +	}
 +}
@@ -221,7 +233,9 @@ index 0000000000000000000000000000000000000000..55fcc5190c81a60173b6846d0239ce2e
 +
 +func fetchOutboundExitIP(ctx context.Context, link string, detour N.Dialer, ipv6 bool) (net.IP, error) {
 +	transport := &http.Transport{
-+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
++		DialContext: func(_ context.Context, network, address string) (net.Conn, error) {
++			// net/http may keep a dial alive after the request is canceled.
++			// A dedicated probe must also cancel an in-flight proxy handshake.
 +			return detour.DialContext(ctx, network, M.ParseSocksaddr(address))
 +		},
 +		TLSClientConfig: &tls.Config{
